@@ -240,12 +240,20 @@ abstract class StreamExecution(
   private val fileManager = CheckpointFileManager.create(new Path(resolvedCheckpointRoot),
       sparkSession.sessionState.newHadoopConf)
 
+  protected def initializeSink(): Unit = {
+    sink match {
+      case sink: Sink => sink.init(analyzedPlan)
+      case _ =>
+    }
+  }
+
   /**
-   * Starts the execution. This returns only after the thread has started and [[QueryStartedEvent]]
+   * Starts the execution. This returns only after thgit e thread has started and [[QueryStartedEvent]]
    * has been posted to all the listeners.
    */
   def start(): Unit = {
     logInfo(s"Starting $prettyIdString. Use $resolvedCheckpointRoot to store the query checkpoint.")
+    initializeSink()
     queryExecutionThread.setDaemon(true)
     queryExecutionThread.start()
     startLatch.await()  // Wait until thread started and QueryStart event has been posted

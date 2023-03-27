@@ -20,6 +20,7 @@ package org.apache.spark.sql.execution.streaming
 import java.util
 
 import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.connector.catalog.{Table, TableCapability}
 import org.apache.spark.sql.types.StructType
 
@@ -32,6 +33,11 @@ import org.apache.spark.sql.types.StructType
  * data source v2.
  */
 trait Sink extends Table {
+
+  /**
+   * This is called to perform initialization before the streaming query starts processing data.
+   */
+  def init(plan: LogicalPlan): Unit = {}
 
   /**
    * Adds a batch of data to this sink. The data for a given `batchId` is deterministic and if
