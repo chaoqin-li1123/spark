@@ -248,7 +248,7 @@ abstract class StreamExecution(
   }
 
   /**
-   * Starts the execution. This returns only after thgit e thread has started and [[QueryStartedEvent]]
+   * Starts the execution. This returns only after the thread has started and [[QueryStartedEvent]]
    * has been posted to all the listeners.
    */
   def start(): Unit = {
