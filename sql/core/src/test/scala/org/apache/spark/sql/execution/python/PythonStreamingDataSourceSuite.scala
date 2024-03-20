@@ -28,11 +28,11 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
 class PythonStreamingDataSourceSuite extends PythonDataSourceSuiteBase {
 
-  protected def simpleDataStreamReaderScript: String =
+  protected def exampleDataStreamReaderScript: String =
     """
       |from pyspark.sql.datasource import DataSourceStreamReader, InputPartition
       |
-      |class SimpleDataStreamReader(DataSourceStreamReader):
+      |class ExampleDataStreamReader(DataSourceStreamReader):
       |    current = 0
       |    def initialOffset(self):
       |        return {"offset": {"partition-1": 0}}
@@ -47,6 +47,18 @@ class PythonStreamingDataSourceSuite extends PythonDataSourceSuiteBase {
       |        1 + 2
       |    def read(self, partition):
       |        yield (partition.value,)
+      |""".stripMargin
+
+  protected def simpleDataStreamReaderScript: String =
+    """
+      |from pyspark.sql.datasource import DataSourceStreamReader, InputPartition
+      |
+      |class SimpleDataStreamReader(SimpleDataSourceStreamReader):
+      |    current = 0
+      |    def initialOffset(self):
+      |        return {"offset": {"partition-1": 0}}
+      |    def read(self, start: dict):
+      |        return ({"offset": {"partition-1": 0}}, [(1,)])
       |""".stripMargin
 
   protected def errorDataStreamReaderScript: String =
@@ -75,11 +87,11 @@ class PythonStreamingDataSourceSuite extends PythonDataSourceSuiteBase {
     val dataSourceScript =
       s"""
          |from pyspark.sql.datasource import DataSource
-         |$simpleDataStreamReaderScript
+         |$exampleDataStreamReaderScript
          |
          |class $dataSourceName(DataSource):
          |    def streamReader(self, schema):
-         |        return SimpleDataStreamReader()
+         |        return ExampleDataStreamReader()
          |""".stripMargin
     val inputSchema = StructType.fromDDL("input BINARY")
 
@@ -107,13 +119,13 @@ class PythonStreamingDataSourceSuite extends PythonDataSourceSuiteBase {
     val dataSourceScript =
       s"""
          |from pyspark.sql.datasource import DataSource
-         |$simpleDataStreamReaderScript
+         |$exampleDataStreamReaderScript
          |
          |class $dataSourceName(DataSource):
          |    def schema(self) -> str:
          |        return "id INT"
          |    def streamReader(self, schema):
-         |        return SimpleDataStreamReader()
+         |        return ExampleDataStreamReader()
          |""".stripMargin
 
     val dataSource = createUserDefinedPythonDataSource(dataSourceName, dataSourceScript)
@@ -146,7 +158,7 @@ class PythonStreamingDataSourceSuite extends PythonDataSourceSuiteBase {
          |        self.start = start
          |        self.end = end
          |
-         |class SimpleDataStreamReader(DataSourceStreamReader):
+         |class ExampleDataStreamReader(DataSourceStreamReader):
          |    current = 0
          |    def initialOffset(self):
          |        return {"offset": 0}
@@ -168,7 +180,7 @@ class PythonStreamingDataSourceSuite extends PythonDataSourceSuiteBase {
          |        return "id INT"
          |
          |    def streamReader(self, schema):
-         |        return SimpleDataStreamReader()
+         |        return ExampleDataStreamReader()
          |""".stripMargin
     val dataSource = createUserDefinedPythonDataSource(dataSourceName, dataSourceScript)
     spark.dataSource.registerPython(dataSourceName, dataSource)
@@ -186,6 +198,35 @@ class PythonStreamingDataSourceSuite extends PythonDataSourceSuiteBase {
     }).start()
     stopSignal.await()
     assert(q.recentProgress.forall(_.numInputRows == 2))
+    q.stop()
+    q.awaitTermination()
+  }
+
+
+  test("Simple streaming data source read") {
+    assume(shouldTestPandasUDFs)
+    val dataSourceScript =
+      s"""
+         |from pyspark.sql.datasource import DataSource
+         |$simpleDataStreamReaderScript
+         |
+         |class $dataSourceName(DataSource):
+         |    def schema(self) -> str:
+         |        return "id INT"
+         |    def simpleStreamReader(self, schema):
+         |        return SimpleDataStreamReader()
+         |""".stripMargin
+    val dataSource = createUserDefinedPythonDataSource(dataSourceName, dataSourceScript)
+    spark.dataSource.registerPython(dataSourceName, dataSource)
+    assert(spark.sessionState.dataSourceManager.dataSourceExists(dataSourceName))
+    val df = spark.readStream.format(dataSourceName).load()
+
+    val stopSignal = new CountDownLatch(1)
+
+    val q = df.writeStream.foreachBatch((df: DataFrame, batchId: Long) => {
+      stopSignal.countDown()
+    }).start()
+    stopSignal.await()
     q.stop()
     q.awaitTermination()
   }
@@ -224,7 +265,7 @@ class PythonStreamingDataSourceSuite extends PythonDataSourceSuiteBase {
          |        self.start = start
          |        self.end = end
          |
-         |class SimpleDataStreamReader(DataSourceStreamReader):
+         |class ExampleDataStreamReader(DataSourceStreamReader):
          |    current = 0
          |    def initialOffset(self):
          |        return {"offset": "0"}
@@ -244,7 +285,7 @@ class PythonStreamingDataSourceSuite extends PythonDataSourceSuiteBase {
          |        return "id INT"
          |
          |    def streamReader(self, schema):
-         |        return SimpleDataStreamReader()
+         |        return ExampleDataStreamReader()
          |""".stripMargin
     val dataSource = createUserDefinedPythonDataSource(dataSourceName, dataSourceScript)
     spark.dataSource.registerPython(dataSourceName, dataSource)

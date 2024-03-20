@@ -21,7 +21,7 @@ import json
 from typing import IO
 
 from pyspark.accumulators import _accumulatorRegistry
-from pyspark.errors import IllegalArgumentException, PySparkAssertionError, PySparkRuntimeError
+from pyspark.errors import IllegalArgumentException, PySparkAssertionError, PySparkNotImplementedError, PySparkRuntimeError
 from pyspark.java_gateway import local_connect_and_auth
 from pyspark.serializers import (
     read_int,
@@ -29,7 +29,7 @@ from pyspark.serializers import (
     write_with_length,
     SpecialLengths,
 )
-from pyspark.sql.datasource import DataSource, DataSourceStreamReader, InputPartition
+from pyspark.sql.datasource import DataSource, DataSourceStreamReader, SimpleDataSourceStreamReader, InputPartition
 from pyspark.sql.types import (
     _parse_datatype_json_string,
     StructType,
@@ -82,20 +82,27 @@ class SimpleInputPartition(InputPartition):
         self.end = end
 
 class SimpleStreamReaderWrapper(DataSourceStreamReader):
+
     def __init__(self, simple_reader):
+        self.current_offset = None
         self.simple_reader = simple_reader
+        self.cache = {}
 
     def initialOffset(self):
         initial_offset = self.simple_reader.initialOffsets()
-        self.committed_offset = initial_offset
+        self.current_offset = initial_offset
         return initial_offset
 
     def latestOffset(self):
-        (end, iter) = self.simple_reader.read(self.committed_offset)
+        (iter, end) = self.simple_reader.read(self.current_offset)
+        self.current_offset = end
+        self.cache[end] = iter
         return end
 
     def commit(self, end: dict):
-        self.committed_offset = end
+        if self.current_offset is None:
+            self.current_offset = end
+        self.cache.pop(end)
         self.simple_reader.commit(end)
 
     def partitions(self, start: dict, end: dict):
@@ -140,7 +147,10 @@ def main(infile: IO, outfile: IO) -> None:
 
         # Instantiate data source reader.
         try:
-            reader = data_source.streamReader(schema=schema)
+            try:
+                reader = data_source.streamReader(schema=schema)
+            except PySparkNotImplementedError:
+                reader = SimpleStreamReaderWrapper(data_source.simpleStreamReader(schema=schema))
             # Initialization succeed.
             write_int(0, outfile)
             outfile.flush()
