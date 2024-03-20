@@ -181,6 +181,11 @@ class DataSource(ABC):
             message_parameters={"feature": "streamReader"},
         )
 
+    def simpleStreamReader(self, schema: StructType) -> "SimpleDataSourceStreamReader":
+        raise PySparkNotImplementedError(
+            error_class="NOT_IMPLEMENTED",
+            message_parameters={"feature": "simpleStreamReader"},
+        )
 
 class InputPartition:
     """
@@ -530,6 +535,15 @@ class WriterCommitMessage:
 
     ...
 
+class SimpleDataSourceStreamReader(ABC):
+    def initialOffset(self) -> dict:
+        ...
+
+    def read(self, start: dict) -> (Iterator[Tuple], dict):
+        ...
+
+    def commit(self, end: dict) -> None:
+        ...
 
 class DataSourceRegistration:
     """
