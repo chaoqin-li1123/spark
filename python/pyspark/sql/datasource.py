@@ -160,6 +160,12 @@ class DataSource(ABC):
             message_parameters={"feature": "writer"},
         )
 
+    def simpleStreamReader(self, schema: StructType) -> "SimpleDataSourceStreamReader":
+        raise PySparkNotImplementedError(
+            error_class="NOT_IMPLEMENTED",
+            message_parameters={"feature": "simpleStreamReader"},
+        )
+
     def streamReader(self, schema: StructType) -> "DataSourceStreamReader":
         """
         Returns a ``DataSourceStreamReader`` instance for reading streaming data.
@@ -179,12 +185,6 @@ class DataSource(ABC):
         raise PySparkNotImplementedError(
             error_class="NOT_IMPLEMENTED",
             message_parameters={"feature": "streamReader"},
-        )
-
-    def simpleStreamReader(self, schema: StructType) -> "SimpleDataSourceStreamReader":
-        raise PySparkNotImplementedError(
-            error_class="NOT_IMPLEMENTED",
-            message_parameters={"feature": "simpleStreamReader"},
         )
 
 class InputPartition:
@@ -223,6 +223,12 @@ class InputPartition:
     def __repr__(self) -> str:
         attributes = ", ".join([f"{k}={v!r}" for k, v in self.__dict__.items()])
         return f"{self.__class__.__name__}({attributes})"
+
+
+class SimpleInputPartition(InputPartition):
+    def __init__(self, start, end):
+        self.start = start
+        self.end = end
 
 
 class DataSourceReader(ABC):
@@ -535,6 +541,7 @@ class WriterCommitMessage:
 
     ...
 
+
 class SimpleDataSourceStreamReader(ABC):
     def initialOffset(self) -> dict:
         ...
@@ -544,6 +551,36 @@ class SimpleDataSourceStreamReader(ABC):
 
     def commit(self, end: dict) -> None:
         ...
+
+
+class SimpleStreamReaderWrapper(DataSourceStreamReader):
+
+    def __init__(self, simple_reader):
+        self.current_offset = None
+        self.simple_reader = simple_reader
+        self.cache = []
+
+    def initialOffset(self):
+        initial_offset = self.simple_reader.initialOffset()
+        self.current_offset = initial_offset
+        return initial_offset
+
+    def latestOffset(self):
+        (iter, end) = self.simple_reader.read(self.current_offset)
+        self.current_offset = end
+        self.cache.append((self.current, end, iter))
+        return end
+
+    def commit(self, end: dict):
+        if self.current_offset is None:
+            self.current_offset = end
+        self.simple_reader.commit(end)
+
+    def partitions(self, start: dict, end: dict):
+        return [SimpleInputPartition(start, end)]
+
+    def read(self, input_partition: InputPartition):
+        return self.simple_reader.read(input_partition.start)[0]
 
 class DataSourceRegistration:
     """

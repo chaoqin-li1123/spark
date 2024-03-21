@@ -51,14 +51,14 @@ class PythonStreamingDataSourceSuite extends PythonDataSourceSuiteBase {
 
   protected def simpleDataStreamReaderScript: String =
     """
-      |from pyspark.sql.datasource import DataSourceStreamReader, InputPartition
+      |from pyspark.sql.datasource import SimpleDataSourceStreamReader, InputPartition
       |
       |class SimpleDataStreamReader(SimpleDataSourceStreamReader):
       |    current = 0
       |    def initialOffset(self):
       |        return {"offset": {"partition-1": 0}}
       |    def read(self, start: dict):
-      |        return ({"offset": {"partition-1": 0}}, [(1,)])
+      |        return ([(1,)], {"offset": {"partition-1": 0}})
       |""".stripMargin
 
   protected def errorDataStreamReaderScript: String =

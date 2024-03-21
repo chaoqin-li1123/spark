@@ -22,7 +22,7 @@ from itertools import islice
 from typing import IO, List, Iterator, Iterable
 
 from pyspark.accumulators import _accumulatorRegistry
-from pyspark.errors import PySparkAssertionError, PySparkRuntimeError
+from pyspark.errors import PySparkAssertionError, PySparkNotImplementedError, PySparkRuntimeError
 from pyspark.java_gateway import local_connect_and_auth
 from pyspark.serializers import (
     read_bool,
@@ -32,7 +32,7 @@ from pyspark.serializers import (
 )
 from pyspark.sql import Row
 from pyspark.sql.connect.conversion import ArrowTableToRowsConversion, LocalDataToArrowConversion
-from pyspark.sql.datasource import DataSource, InputPartition
+from pyspark.sql.datasource import DataSource, InputPartition, SimpleStreamReaderWrapper
 from pyspark.sql.pandas.types import to_arrow_schema
 from pyspark.sql.types import (
     _parse_datatype_json_string,
@@ -131,11 +131,14 @@ def main(infile: IO, outfile: IO) -> None:
         is_streaming = read_bool(infile)
 
         # Instantiate data source reader.
-        reader = (
-            data_source.streamReader(schema=schema)
-            if is_streaming
-            else data_source.reader(schema=schema)
-        )
+        if is_streaming:
+            try:
+                reader = data_source.streamReader(schema=schema)
+            except PySparkNotImplementedError:
+                reader = SimpleStreamReaderWrapper(data_source.simpleStreamReader(schema=schema))
+        else:
+            reader = data_source.reader(schema=schema)
+
 
         # Wrap the data source read logic in an mapInArrow UDF.
         import pyarrow as pa

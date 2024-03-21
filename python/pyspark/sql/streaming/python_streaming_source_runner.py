@@ -29,7 +29,7 @@ from pyspark.serializers import (
     write_with_length,
     SpecialLengths,
 )
-from pyspark.sql.datasource import DataSource, DataSourceStreamReader, SimpleDataSourceStreamReader, InputPartition
+from pyspark.sql.datasource import DataSource, DataSourceStreamReader, SimpleDataSourceStreamReader, SimpleStreamReaderWrapper, InputPartition
 from pyspark.sql.types import (
     _parse_datatype_json_string,
     StructType,
@@ -80,36 +80,6 @@ class SimpleInputPartition(InputPartition):
     def __init__(self, start, end):
         self.start = start
         self.end = end
-
-class SimpleStreamReaderWrapper(DataSourceStreamReader):
-
-    def __init__(self, simple_reader):
-        self.current_offset = None
-        self.simple_reader = simple_reader
-        self.cache = {}
-
-    def initialOffset(self):
-        initial_offset = self.simple_reader.initialOffsets()
-        self.current_offset = initial_offset
-        return initial_offset
-
-    def latestOffset(self):
-        (iter, end) = self.simple_reader.read(self.current_offset)
-        self.current_offset = end
-        self.cache[end] = iter
-        return end
-
-    def commit(self, end: dict):
-        if self.current_offset is None:
-            self.current_offset = end
-        self.cache.pop(end)
-        self.simple_reader.commit(end)
-
-    def partitions(self, start: dict, end: dict):
-        return SimpleInputPartition(start, end)
-
-    def read(self, input_partition: InputPartition):
-        return self.simple_reader.read(input_partition.start)[0]
 
 def main(infile: IO, outfile: IO) -> None:
     try:
