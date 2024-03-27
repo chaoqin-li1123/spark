@@ -14,8 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import json
 from abc import ABC, abstractmethod
 from collections import UserDict
+from itertools import chain
 from typing import Any, Dict, Iterator, List, Sequence, Tuple, Type, Union, TYPE_CHECKING
 
 from pyspark.sql import Row
@@ -226,9 +228,10 @@ class InputPartition:
 
 
 class SimpleInputPartition(InputPartition):
-    def __init__(self, start, end):
+    def __init__(self, start, end, iter):
         self.start = start
         self.end = end
+        self.iter = iter
 
 
 class DataSourceReader(ABC):
@@ -543,9 +546,6 @@ class WriterCommitMessage:
 
 
 class SimpleDataSourceStreamReader(ABC):
-    def initialOffset(self) -> dict:
-        ...
-
     def read(self, start: dict) -> (Iterator[Tuple], dict):
         ...
 
@@ -554,21 +554,18 @@ class SimpleDataSourceStreamReader(ABC):
 
 
 class SimpleStreamReaderWrapper(DataSourceStreamReader):
-
     def __init__(self, simple_reader):
         self.current_offset = None
         self.simple_reader = simple_reader
         self.cache = []
 
     def initialOffset(self):
-        initial_offset = self.simple_reader.initialOffset()
-        self.current_offset = initial_offset
-        return initial_offset
+        return None
 
     def latestOffset(self):
         (iter, end) = self.simple_reader.read(self.current_offset)
+        self.cache.append((self.current_offset, end, iter))
         self.current_offset = end
-        self.cache.append((self.current, end, iter))
         return end
 
     def commit(self, end: dict):
@@ -577,10 +574,19 @@ class SimpleStreamReaderWrapper(DataSourceStreamReader):
         self.simple_reader.commit(end)
 
     def partitions(self, start: dict, end: dict):
-        return [SimpleInputPartition(start, end)]
+        assert (self.cache[-1][1] == end)
+        start_idx = 0
+        for i in range(len(self.cache)):
+            # print(json.dumps(self.cache[i][0]) + " ggg " + json.dumps(self.cache[i][1]))
+            if json.dumps(self.cache[i][0]) == json.dumps(start):
+                start_idx = i
+        iters = [entry[2] for entry in self.cache[start_idx:]]
+        iter = chain(iters)
+        return [SimpleInputPartition(start, end, iter)]
 
     def read(self, input_partition: InputPartition):
         return self.simple_reader.read(input_partition.start)[0]
+
 
 class DataSourceRegistration:
     """

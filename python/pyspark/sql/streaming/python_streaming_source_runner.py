@@ -18,7 +18,8 @@
 import os
 import sys
 import json
-from typing import IO
+import pyarrow as pa
+from typing import IO, Iterable, Iterator, Tuple
 
 from pyspark.accumulators import _accumulatorRegistry
 from pyspark.errors import IllegalArgumentException, PySparkAssertionError, PySparkNotImplementedError, PySparkRuntimeError
@@ -30,10 +31,12 @@ from pyspark.serializers import (
     SpecialLengths,
 )
 from pyspark.sql.datasource import DataSource, DataSourceStreamReader, SimpleDataSourceStreamReader, SimpleStreamReaderWrapper, InputPartition
+from pyspark.sql.pandas.serializers import ArrowStreamSerializer
 from pyspark.sql.types import (
     _parse_datatype_json_string,
     StructType,
 )
+from pyspark.sql.worker.plan_data_source_read import read_arrow_batches
 from pyspark.util import handle_worker_exception
 from pyspark.worker_util import (
     check_python_version,
@@ -49,6 +52,7 @@ INITIAL_OFFSET_FUNC_ID = 884
 LATEST_OFFSET_FUNC_ID = 885
 PARTITIONS_FUNC_ID = 886
 COMMIT_FUNC_ID = 887
+SEND_BATCH_FUNC_ID = 888
 
 
 def initial_offset_func(reader: DataSourceStreamReader, outfile: IO) -> None:
@@ -76,10 +80,12 @@ def commit_func(reader: DataSourceStreamReader, infile: IO, outfile: IO) -> None
     reader.commit(end_offset)
     write_int(0, outfile)
 
-class SimpleInputPartition(InputPartition):
-    def __init__(self, start, end):
-        self.start = start
-        self.end = end
+
+def send_batch_func(rows: Iterator[Tuple], outfile: IO, schema, data_source) -> None:
+    batches = read_arrow_batches(rows, 1000, schema, data_source)
+    serializer = ArrowStreamSerializer
+    serializer.dump_stream(batches, outfile)
+
 
 def main(infile: IO, outfile: IO) -> None:
     try:
@@ -136,6 +142,9 @@ def main(infile: IO, outfile: IO) -> None:
                     partitions_func(reader, infile, outfile)
                 elif func_id == COMMIT_FUNC_ID:
                     commit_func(reader, infile, outfile)
+                elif func_id == SEND_BATCH_FUNC_ID:
+                    rows = [(2, 3), (4, 6)]
+                    send_batch_func(rows, outfile, schema, data_source)
                 else:
                     raise IllegalArgumentException(
                         error_class="UNSUPPORTED_OPERATION",
