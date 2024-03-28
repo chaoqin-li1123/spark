@@ -18,7 +18,6 @@
 import os
 import sys
 import json
-import pyarrow as pa
 from typing import IO, Iterable, Iterator, Tuple
 
 from pyspark.accumulators import _accumulatorRegistry
@@ -82,8 +81,9 @@ def commit_func(reader: DataSourceStreamReader, infile: IO, outfile: IO) -> None
 
 
 def send_batch_func(rows: Iterator[Tuple], outfile: IO, schema, data_source) -> None:
+    write_int(6, outfile)
     batches = read_arrow_batches(rows, 1000, schema, data_source)
-    serializer = ArrowStreamSerializer
+    serializer = ArrowStreamSerializer()
     serializer.dump_stream(batches, outfile)
 
 
@@ -143,8 +143,8 @@ def main(infile: IO, outfile: IO) -> None:
                 elif func_id == COMMIT_FUNC_ID:
                     commit_func(reader, infile, outfile)
                 elif func_id == SEND_BATCH_FUNC_ID:
-                    rows = [(2, 3), (4, 6)]
-                    send_batch_func(rows, outfile, schema, data_source)
+                    rows = [(2,), (4,)]
+                    send_batch_func(iter(rows), outfile, schema, data_source)
                 else:
                     raise IllegalArgumentException(
                         error_class="UNSUPPORTED_OPERATION",

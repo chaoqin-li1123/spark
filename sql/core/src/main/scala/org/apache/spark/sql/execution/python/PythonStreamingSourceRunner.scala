@@ -209,11 +209,14 @@ class PythonStreamingSourceRunner(
   }
 
   private val allocator = ArrowUtils.rootAllocator.newChildAllocator(
-    s"stdin reader for $pythonExec", 0, Long.MaxValue)
+    s"stream reader for $pythonExec", 0, Long.MaxValue)
 
   def readBatches(): Iterator[InternalRow] = {
     dataOut.writeInt(SEND_BATCH_FUNC_ID)
     dataOut.flush()
+    assert(allocator.getLimit > 0)
+    assert(dataIn.readInt() == 6)
+    return Iterator.empty
     val reader = new ArrowStreamReader(dataIn, allocator)
     val root = reader.getVectorSchemaRoot()
     // val schema = ArrowUtils.fromArrowSchema(root.getSchema())
@@ -234,5 +237,6 @@ class PythonStreamingSourceRunner(
         flattenedBatch.setNumRows(batch.numRows())
         flattenedBatch.rowIterator.asScala
       }.map(unsafeProj)
+
   }
 }

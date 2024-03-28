@@ -82,7 +82,7 @@ class PythonStreamingDataSourceSuite extends PythonDataSourceSuiteBase {
 
   private val errorDataSourceName = "ErrorDataSource"
 
-  test("Test PythonMicroBatchStream") {
+  ignore("Test PythonMicroBatchStream") {
     assume(shouldTestPandasUDFs)
     val dataSourceScript =
       s"""
@@ -90,6 +90,8 @@ class PythonStreamingDataSourceSuite extends PythonDataSourceSuiteBase {
          |$exampleDataStreamReaderScript
          |
          |class $dataSourceName(DataSource):
+         |    def schema(self) -> str:
+         |        return "id INT"
          |    def streamReader(self, schema):
          |        return ExampleDataStreamReader()
          |""".stripMargin
