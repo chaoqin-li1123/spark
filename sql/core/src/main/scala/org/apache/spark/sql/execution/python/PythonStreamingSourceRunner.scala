@@ -214,12 +214,10 @@ class PythonStreamingSourceRunner(
   def readBatches(): Iterator[InternalRow] = {
     dataOut.writeInt(SEND_BATCH_FUNC_ID)
     dataOut.flush()
-    assert(allocator.getLimit > 0)
     assert(dataIn.readInt() == 6)
-    return Iterator.empty
     val reader = new ArrowStreamReader(dataIn, allocator)
     val root = reader.getVectorSchemaRoot()
-    // val schema = ArrowUtils.fromArrowSchema(root.getSchema())
+    val schema = ArrowUtils.fromArrowSchema(root.getSchema())
     val vectors = root.getFieldVectors().asScala.map { vector =>
       new ArrowColumnVector(vector)
     }.toArray[ColumnVector]
@@ -227,7 +225,7 @@ class PythonStreamingSourceRunner(
     while (reader.loadNextBatch()) {
       batches += new ColumnarBatch(vectors)
     }
-    val unsafeProj = UnsafeProjection.create(outputSchema)
+    val unsafeProj = UnsafeProjection.create(schema)
     batches.iterator.flatMap { batch =>
         // Scalar Iterator UDF returns a StructType column in ColumnarBatch, select
         // the children here
@@ -237,6 +235,5 @@ class PythonStreamingSourceRunner(
         flattenedBatch.setNumRows(batch.numRows())
         flattenedBatch.rowIterator.asScala
       }.map(unsafeProj)
-
   }
 }

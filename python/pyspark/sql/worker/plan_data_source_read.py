@@ -111,7 +111,7 @@ def read_arrow_batches(output_iter, max_arrow_batch_size, return_type, data_sour
                 for col in range(num_cols):
                     pylist[col].append(column_converters[col](result[col]))
 
-        return pa.RecordBatch.from_arrays(pylist, schema=pa_schema)
+        yield pa.RecordBatch.from_arrays(pylist, schema=pa_schema)
 
 
 def main(infile: IO, outfile: IO) -> None:
@@ -246,7 +246,7 @@ def main(infile: IO, outfile: IO) -> None:
                     },
                 )
 
-            yield read_arrow_batches(output_iter, max_arrow_batch_size, return_type, data_source)
+            return read_arrow_batches(output_iter, max_arrow_batch_size, return_type, data_source)
 
         command = (data_source_read_func, return_type)
         pickleSer._write_with_length(command, outfile)
