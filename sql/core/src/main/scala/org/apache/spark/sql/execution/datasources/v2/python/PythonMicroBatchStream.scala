@@ -44,7 +44,12 @@ class PythonMicroBatchStream(
   override def latestOffset(): Offset = PythonStreamingSourceOffset(runner.latestOffset())
 
   override def planInputPartitions(start: Offset, end: Offset): Array[InputPartition] = {
-    runner.readBatches()
+    try {
+      val rows = runner.readBatches().toArray
+      println("numRows in microbatch: " + rows.length)
+    } catch {
+      case e : Throwable => e.printStackTrace()
+    }
     runner.partitions(start.asInstanceOf[PythonStreamingSourceOffset].json,
       end.asInstanceOf[PythonStreamingSourceOffset].json)
       .zipWithIndex.map(p => PythonInputPartition(p._2, p._1))

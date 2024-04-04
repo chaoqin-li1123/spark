@@ -111,7 +111,8 @@ def read_arrow_batches(output_iter, max_arrow_batch_size, return_type, data_sour
                 for col in range(num_cols):
                     pylist[col].append(column_converters[col](result[col]))
 
-        yield pa.RecordBatch.from_arrays(pylist, schema=pa_schema)
+        batch = pa.RecordBatch.from_arrays(pylist, schema=pa_schema)
+        yield batch
 
 
 def main(infile: IO, outfile: IO) -> None:

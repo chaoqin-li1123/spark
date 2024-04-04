@@ -105,6 +105,7 @@ class ArrowStreamSerializer(Serializer):
                 if writer is None:
                     writer = pa.RecordBatchStreamWriter(stream, batch.schema)
                 writer.write_batch(batch)
+                print("numRows in record batch: " + str(batch.num_rows))
         finally:
             if writer is not None:
                 writer.close()

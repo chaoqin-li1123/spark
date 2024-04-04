@@ -84,7 +84,12 @@ def send_batch_func(rows: Iterator[Tuple], outfile: IO, schema, data_source) -> 
     write_int(6, outfile)
     batches = read_arrow_batches(rows, 1000, schema, data_source)
     serializer = ArrowStreamSerializer()
-    serializer.dump_stream(batches, outfile)
+    try:
+        serializer.dump_stream(batches, outfile)
+    except BaseException as e:
+        print(e)
+    write_int(222, outfile)
+
 
 
 def main(infile: IO, outfile: IO) -> None:
@@ -143,7 +148,7 @@ def main(infile: IO, outfile: IO) -> None:
                 elif func_id == COMMIT_FUNC_ID:
                     commit_func(reader, infile, outfile)
                 elif func_id == SEND_BATCH_FUNC_ID:
-                    rows = [(2,), (4,)]
+                    rows = [(2,), (4,), (34,)]
                     send_batch_func(iter(rows), outfile, schema, data_source)
                 else:
                     raise IllegalArgumentException(

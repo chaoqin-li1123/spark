@@ -32,6 +32,7 @@ import org.apache.spark.internal.config.BUFFER_SIZE
 import org.apache.spark.internal.config.Python.PYTHON_AUTH_SOCKET_TIMEOUT
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.UnsafeProjection
+import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.ArrowUtils
@@ -195,7 +196,7 @@ class PythonStreamingSourceRunner(
   def stop(): Unit = {
     logInfo(s"Stopping streaming runner for module: $workerModule.")
     try {
-      allocator.close()
+      // allocator.close()
       pythonWorkerFactory.foreach { factory =>
         pythonWorker.foreach { worker =>
           factory.stopWorker(worker)
@@ -212,28 +213,30 @@ class PythonStreamingSourceRunner(
     s"stream reader for $pythonExec", 0, Long.MaxValue)
 
   def readBatches(): Iterator[InternalRow] = {
+    val outputAttributes = toAttributes(outputSchema)
     dataOut.writeInt(SEND_BATCH_FUNC_ID)
     dataOut.flush()
     assert(dataIn.readInt() == 6)
     val reader = new ArrowStreamReader(dataIn, allocator)
     val root = reader.getVectorSchemaRoot()
     val schema = ArrowUtils.fromArrowSchema(root.getSchema())
-    val vectors = root.getFieldVectors().asScala.map { vector =>
+    def vectors = root.getFieldVectors().asScala.map { vector =>
       new ArrowColumnVector(vector)
     }.toArray[ColumnVector]
+    assert(schema == outputSchema)
     val batches = ArrayBuffer[ColumnarBatch]()
-    while (reader.loadNextBatch()) {
-      batches += new ColumnarBatch(vectors)
+    var hasNextBatch = true
+    while (hasNextBatch) {
+      val batch = new ColumnarBatch(vectors)
+      batches += batch
+      hasNextBatch = reader.loadNextBatch()
     }
-    val unsafeProj = UnsafeProjection.create(schema)
+    reader.close(false)
+    assert(dataIn.readInt() == 222)
+    val unsafeProj = UnsafeProjection.create(outputAttributes, outputAttributes)
     batches.iterator.flatMap { batch =>
-        // Scalar Iterator UDF returns a StructType column in ColumnarBatch, select
-        // the children here
-        val structVector = batch.column(0).asInstanceOf[ArrowColumnVector]
-        val outputVectors = outputSchema.indices.map(structVector.getChild)
-        val flattenedBatch = new ColumnarBatch(outputVectors.toArray)
-        flattenedBatch.setNumRows(batch.numRows())
-        flattenedBatch.rowIterator.asScala
-      }.map(unsafeProj)
+      println("numRows in batch: " + batch.numRows())
+      batch.rowIterator.asScala
+    }.map(unsafeProj)
   }
 }
