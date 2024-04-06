@@ -32,7 +32,6 @@ import org.apache.spark.internal.config.BUFFER_SIZE
 import org.apache.spark.internal.config.Python.PYTHON_AUTH_SOCKET_TIMEOUT
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.UnsafeProjection
-import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.ArrowUtils
@@ -213,7 +212,6 @@ class PythonStreamingSourceRunner(
     s"stream reader for $pythonExec", 0, Long.MaxValue)
 
   def readBatches(): Iterator[InternalRow] = {
-    val outputAttributes = toAttributes(outputSchema)
     dataOut.writeInt(SEND_BATCH_FUNC_ID)
     dataOut.flush()
     assert(dataIn.readInt() == 6)
@@ -224,20 +222,22 @@ class PythonStreamingSourceRunner(
       new ArrowColumnVector(vector)
     }.toArray[ColumnVector]
     assert(schema == outputSchema)
+    val rows = ArrayBuffer[InternalRow]()
     val batches = ArrayBuffer[ColumnarBatch]()
-    var hasNextBatch = true
-    while (hasNextBatch) {
+    val unsafeProj = UnsafeProjection.create(outputSchema)
+    while (reader.loadNextBatch()) {
       val batch = new ColumnarBatch(vectors)
       batch.setNumRows(root.getRowCount)
-      batches += batch
-      hasNextBatch = reader.loadNextBatch()
+      batch.rowIterator().asScala.foreach { p =>
+        // println(s"lsdf: ${p.getInt(0)}")
+      }
+      rows.appendAll(batch.rowIterator().asScala.map(_.copy()))
+    }
+    rows.zipWithIndex.foreach { p =>
+      println(s"lsdf: ${p._1.getInt(0)}")
     }
     reader.close(false)
     assert(dataIn.readInt() == 222)
-    val unsafeProj = UnsafeProjection.create(outputAttributes, outputAttributes)
-    batches.iterator.flatMap { batch =>
-      println("numRows in batch: " + batch.numRows())
-      batch.rowIterator.asScala
-    }.map(unsafeProj)
+    rows.iterator
   }
 }

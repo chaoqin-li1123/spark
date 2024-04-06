@@ -148,7 +148,7 @@ def main(infile: IO, outfile: IO) -> None:
                 elif func_id == COMMIT_FUNC_ID:
                     commit_func(reader, infile, outfile)
                 elif func_id == SEND_BATCH_FUNC_ID:
-                    rows = [(2,), (4,), (34,)]
+                    rows = [(0,), (15,), (30,)]
                     send_batch_func(iter(rows), outfile, schema, data_source)
                 else:
                     raise IllegalArgumentException(

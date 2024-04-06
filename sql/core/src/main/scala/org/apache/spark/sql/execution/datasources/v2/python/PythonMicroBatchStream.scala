@@ -16,12 +16,14 @@
  */
 package org.apache.spark.sql.execution.datasources.v2.python
 
+import org.apache.spark.SparkEnv
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.connector.read.{InputPartition, PartitionReaderFactory}
 import org.apache.spark.sql.connector.read.streaming.{MicroBatchStream, Offset}
 import org.apache.spark.sql.execution.python.PythonStreamingSourceRunner
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.storage.{BlockId, StorageLevel}
 
 case class PythonStreamingSourceOffset(json: String) extends Offset
 
@@ -45,7 +47,9 @@ class PythonMicroBatchStream(
 
   override def planInputPartitions(start: Offset, end: Offset): Array[InputPartition] = {
     try {
-      val rows = runner.readBatches().toArray
+      val rows = runner.readBatches()
+      SparkEnv.get.blockManager
+        .putIterator(BlockId("input-2234-8876"), rows, StorageLevel.MEMORY_AND_DISK_SER, true)
       println("numRows in microbatch: " + rows.length)
     } catch {
       case e : Throwable => e.printStackTrace()

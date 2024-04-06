@@ -70,6 +70,7 @@ def read_arrow_batches(output_iter, max_arrow_batch_size, return_type, data_sour
     for batch in batched(output_iter, max_arrow_batch_size):
         pylist: List[List] = [[] for _ in range(num_cols)]
         for result in batch:
+            print(result)
             # Validate the output row schema.
             if hasattr(result, "__len__") and len(result) != num_cols:
                 raise PySparkRuntimeError(
@@ -110,7 +111,7 @@ def read_arrow_batches(output_iter, max_arrow_batch_size, return_type, data_sour
             else:
                 for col in range(num_cols):
                     pylist[col].append(column_converters[col](result[col]))
-
+        print(pylist)
         batch = pa.RecordBatch.from_arrays(pylist, schema=pa_schema)
         yield batch
 
