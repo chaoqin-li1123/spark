@@ -49,7 +49,7 @@ Method that needs to be implemented for a capability:
 |            |   streamReader()     |                  |
 | streaming  |         or           |  streamWriter()  |
 |            | simpleStreamReader() |                  |
-+------------+----------------------|------------------|
++------------+----------------------+------------------+
 
 .. code-block:: python
 
