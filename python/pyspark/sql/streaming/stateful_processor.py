@@ -57,7 +57,7 @@ class ListState:
         pass
 
     def get(self) -> Iterator["PandasDataFrameLike"]:
-        pass
+        self._state_api_client.listStateCallGet(self._state_name)
 
     def update(self, new_value: Iterator["PandasDataFrameLike"]) -> None:
         pass

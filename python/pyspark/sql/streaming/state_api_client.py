@@ -18,11 +18,14 @@
 from enum import Enum
 import os
 import socket
-from typing import Union, cast
+from typing import Any, TYPE_CHECKING, Iterator, Union, cast
 
 import pyspark.sql.streaming.StateMessage_pb2 as stateMessage
 from pyspark.serializers import write_int, read_int
 from pyspark.sql.types import StructType, _parse_datatype_string
+
+if TYPE_CHECKING:
+    from pyspark.sql.pandas._typing import DataFrameLike as PandasDataFrameLike
 
 class StatefulProcessorHandleState(Enum):
     CREATED = 1
@@ -69,6 +72,18 @@ class StateApiClient:
         self._send_proto_message(message)
         status = read_int(self.sockfile)
         print(f"status= {status}")
+
+    def listStateCallGet(self, state_name: str) -> Iterator["PandasDataFrameLike"]:
+        get_call = stateMessage.Get()
+        get_call.stateName = state_name
+        call = stateMessage.ListStateCall(get=get_call)
+
+        message = stateMessage.StateRequest(listStateCall=call)
+
+        self._send_proto_message(message)
+        status = read_int(self.sockfile)
+        print(f"status= {status}")
+        return iter([])
         
 
     def _get_proto_state(self, state: StatefulProcessorHandleState) -> stateMessage.HandleState.ValueType:

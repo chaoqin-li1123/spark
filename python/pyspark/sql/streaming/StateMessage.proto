@@ -37,7 +37,9 @@ message ListStateCall {
 
 message Exists {}
 
-message Get {}
+message Get {
+  string stateName = 1;
+}
 
 message Update {}
 

@@ -26,8 +26,8 @@ import com.google.protobuf.ByteString
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.execution.streaming.{ImplicitGroupingKeyTracker, StatefulProcessorHandleImpl, StatefulProcessorHandleState}
-import org.apache.spark.sql.execution.streaming.state.StateMessage.{HandleState, StateRequest}
-import org.apache.spark.sql.streaming.ValueState
+import org.apache.spark.sql.execution.streaming.state.StateMessage.{HandleState, ListStateCall, StatefulProcessorHandleCall, StateRequest}
+import org.apache.spark.sql.streaming.{ListState, ValueState}
 
 class TransformWithStateInPandasStateServer(
     private val stateServerSocket: ServerSocket,
@@ -39,6 +39,7 @@ class TransformWithStateInPandasStateServer(
   private var outputStream: DataOutputStream = _
 
   private val valueStates = mutable.HashMap[String, ValueState[String]]()
+  private val listStates = mutable.HashMap[String, ListState[String]]()
 
   def run(): Unit = {
     logWarning(s"Waiting for connection from Python worker")
@@ -84,13 +85,29 @@ class TransformWithStateInPandasStateServer(
   private def handleRequest(message: StateRequest): Unit = {
     if (message.getMethodCase == StateRequest.MethodCase.STATEFULPROCESSORHANDLECALL) {
       val statefulProcessorHandleRequest = message.getStatefulProcessorHandleCall
-      val requestedState = statefulProcessorHandleRequest.getSetHandleState.getState
-
-      requestedState match {
-        case HandleState.INITIALIZED =>
-          logWarning(s"set handle state to Initialized")
-          statefulProcessorHandle.setHandleState(StatefulProcessorHandleState.INITIALIZED)
-        case _ =>
+      if (statefulProcessorHandleRequest.getMethodCase ==
+        StatefulProcessorHandleCall.MethodCase.SETHANDLESTATE) {
+        val requestedState = statefulProcessorHandleRequest.getSetHandleState.getState
+        requestedState match {
+          case HandleState.INITIALIZED =>
+            logWarning(s"set handle state to Initialized")
+            statefulProcessorHandle.setHandleState(StatefulProcessorHandleState.INITIALIZED)
+          case _ =>
+        }
+      } else if (statefulProcessorHandleRequest.getMethodCase ==
+        StatefulProcessorHandleCall.MethodCase.GETLISTSTATE) {
+        val listStateName = statefulProcessorHandleRequest.getGetListState.getStateName
+        initializeState("ListState", listStateName)
+      }
+    } else if (message.getMethodCase == StateRequest.MethodCase.LISTSTATECALL) {
+      val listStateCall = message.getListStateCall
+      val methodCase = listStateCall.getMethodCase
+      if (methodCase == ListStateCall.MethodCase.GET) {
+        logInfo("Handling list state get")
+        outputStream.writeInt(0)
+        outputStream.flush()
+      } else {
+        outputStream.writeInt(1)
       }
     }
   }
@@ -176,6 +193,10 @@ class TransformWithStateInPandasStateServer(
     if (stateType == "ValueState") {
       val state = statefulProcessorHandle.getValueState[String](stateName)
       valueStates.put(stateName, state)
+      outputStream.writeInt(0)
+    } else if (stateType == "ListState") {
+      val state = statefulProcessorHandle.getListState[String](stateName)
+      listStates.put(stateName, state)
       outputStream.writeInt(0)
     } else {
       outputStream.writeInt(1)
