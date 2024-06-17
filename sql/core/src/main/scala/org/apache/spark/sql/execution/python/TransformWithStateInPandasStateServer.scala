@@ -21,13 +21,20 @@ import java.io.{BufferedInputStream, BufferedOutputStream, DataInputStream, Data
 import java.net.ServerSocket
 
 import scala.collection.mutable
+import scala.jdk.CollectionConverters.IterableHasAsJava
 
 import com.google.protobuf.ByteString
+import org.apache.arrow.vector.{VarCharVector, VectorSchemaRoot}
+import org.apache.arrow.vector.ipc.ArrowStreamWriter
+import org.apache.arrow.vector.types.pojo.{Field, FieldType, Schema}
+import org.apache.arrow.vector.types.pojo.ArrowType.Utf8
+import org.apache.arrow.vector.util.Text
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.execution.streaming.{ImplicitGroupingKeyTracker, StatefulProcessorHandleImpl, StatefulProcessorHandleState}
 import org.apache.spark.sql.execution.streaming.state.StateMessage.{HandleState, ListStateCall, StatefulProcessorHandleCall, StateRequest}
 import org.apache.spark.sql.streaming.{ListState, ValueState}
+import org.apache.spark.sql.util.ArrowUtils
 
 class TransformWithStateInPandasStateServer(
     private val stateServerSocket: ServerSocket,
@@ -40,6 +47,19 @@ class TransformWithStateInPandasStateServer(
 
   private val valueStates = mutable.HashMap[String, ValueState[String]]()
   private val listStates = mutable.HashMap[String, ListState[String]]()
+
+  val stringList1 = List("apple1", "banana1", "cherry1", "date1", "elderberry1", "fig1")
+  val iterator1: Iterator[String] = stringList1.iterator
+
+  val stringList2 = List("apple2", "banana2", "cherry2")
+  val iterator2: Iterator[String] = stringList2.iterator
+
+  val iteratorMap: Map[String, Iterator[String]] = Map(
+    "state1" -> iterator1,
+    "state2" -> iterator2
+  )
+
+  var count = 0
 
   def run(): Unit = {
     logWarning(s"Waiting for connection from Python worker")
@@ -92,20 +112,58 @@ class TransformWithStateInPandasStateServer(
           case HandleState.INITIALIZED =>
             logWarning(s"set handle state to Initialized")
             statefulProcessorHandle.setHandleState(StatefulProcessorHandleState.INITIALIZED)
+          case HandleState.CLOSED =>
+            logWarning(s"set handle state to closed")
+            statefulProcessorHandle.setHandleState(StatefulProcessorHandleState.CLOSED)
           case _ =>
         }
       } else if (statefulProcessorHandleRequest.getMethodCase ==
         StatefulProcessorHandleCall.MethodCase.GETLISTSTATE) {
         val listStateName = statefulProcessorHandleRequest.getGetListState.getStateName
-        initializeState("ListState", listStateName)
+//        initializeState("ListState", listStateName)
+        logWarning(s"get list state for $listStateName and schema" +
+          s" ${statefulProcessorHandleRequest.getGetListState.getSchema}")
       }
     } else if (message.getMethodCase == StateRequest.MethodCase.LISTSTATECALL) {
       val listStateCall = message.getListStateCall
       val methodCase = listStateCall.getMethodCase
       if (methodCase == ListStateCall.MethodCase.GET) {
-        logInfo("Handling list state get")
-        outputStream.writeInt(0)
+        logWarning("Handling list state get")
+        val fields = List(
+          new Field("stringColumn", FieldType.nullable(new Utf8()), null)
+        )
+
+        val mySchema = new Schema(fields.asJava)
+        val allocator =
+          ArrowUtils.rootAllocator.newChildAllocator(s"stdout writer for python",
+            0, Long.MaxValue)
+        val root = VectorSchemaRoot.create(mySchema, allocator)
+
+        val vector = root.getVector("stringColumn").asInstanceOf[VarCharVector]
+        root.allocateNew()
+
+        logWarning(s"Handling count $count")
+        if (count % 2 == 0) {
+          vector.allocateNew(2)
+          val localIterator1 = iteratorMap("state1")
+          vector.setSafe(0, new Text(localIterator1.next()))
+          vector.setSafe(1, new Text(localIterator1.next()))
+          root.setRowCount(2)
+        } else {
+          val localIterator2 = iteratorMap("state2")
+          vector.setSafe(0, new Text(localIterator2.next()))
+          root.setRowCount(1)
+        }
+        count += 1
+        val writer = new ArrowStreamWriter(root, null, outputStream)
+        writer.writeBatch()
+        writer.end()
         outputStream.flush()
+//        writer.close()
+
+        // Clean up
+//        root.close()
+//        allocator.close()
       } else {
         outputStream.writeInt(1)
       }

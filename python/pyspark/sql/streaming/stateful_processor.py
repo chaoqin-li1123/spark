@@ -71,11 +71,13 @@ class StatefulProcessorHandle:
         self,
         state_api_client: StateApiClient) -> None:
         self.state_api_client = state_api_client
+        print(f"StatefulProcessorHandle is initialized")
 
     def getValueState(self, state_name: str, schema: Union[StructType, str]) -> ValueState:
         pass
 
     def getListState(self, state_name: str, schema: Union[StructType, str]) -> ListState:
+        print(f"getting list state for {state_name}")
         self.state_api_client.getListState(state_name, schema)
         return ListState(self.state_api_client, state_name)
 

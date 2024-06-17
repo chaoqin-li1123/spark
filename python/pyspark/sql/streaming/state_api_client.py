@@ -18,11 +18,12 @@
 from enum import Enum
 import os
 import socket
+import pyarrow as pa
 from typing import Any, TYPE_CHECKING, Iterator, Union, cast
 
 import pyspark.sql.streaming.StateMessage_pb2 as stateMessage
 from pyspark.serializers import write_int, read_int
-from pyspark.sql.types import StructType, _parse_datatype_string
+from pyspark.sql.types import StructType, _parse_datatype_string, StructField, LongType
 
 if TYPE_CHECKING:
     from pyspark.sql.pandas._typing import DataFrameLike as PandasDataFrameLike
@@ -42,9 +43,33 @@ class StateApiClient:
         self.sockfile = self._client_socket.makefile("rwb", int(os.environ.get("SPARK_BUFFER_SIZE", 65536)))
         print(f"client is ready - connection established")
         self.handle_state = StatefulProcessorHandleState.CREATED
+        print(f"handle state is {self.handle_state}")
+        print(f"setting handle state to INITIALIZED")
+        self.setHandleState(StatefulProcessorHandleState.INITIALIZED)
+        print(f"handle state is {self.handle_state}")
+        print(f"getting list state")
+        schema = StructType([
+            StructField("value", LongType(), True),
+            StructField("timestamp", LongType(), True)
+        ])
+        self.getListState("state1", schema)
+        print(f"list state is initialized")
+
+        for i in range(6):
+            print(f"calling list state get at attempt {i}")
+            self.listStateCallGet("state1")
+            print(f"reading arrow batches from socket and writing to a buffer")
+            reader = pa.ipc.open_stream(self.sockfile)
+            for batch in reader:
+                print(f"Read arrow batch with attempt {i}: {batch.to_pandas()}")
+            print(f"finished calling list state get")
+        print(f"setting handle state to CLOSED")
+        self.setHandleState(StatefulProcessorHandleState.CLOSED)
+        print(f"handle state is {self.handle_state}")
 
     
     def setHandleState(self, state: StatefulProcessorHandleState) -> None:
+        print(f"setting handle state to {state}")
         proto_state = self._get_proto_state(state)
         set_handle_state = stateMessage.SetHandleState(state=proto_state)
         handle_call = stateMessage.StatefulProcessorHandleCall(setHandleState=set_handle_state)
@@ -59,6 +84,7 @@ class StateApiClient:
 
     
     def getListState(self, state_name: str, schema: Union[StructType, str]) -> None:
+        print("initializing list state")
         if isinstance(schema, str):
             schema = cast(StructType, _parse_datatype_string(schema))
         
@@ -98,7 +124,7 @@ class StateApiClient:
         
     def _send_proto_message(self, message: stateMessage.StateRequest) -> None:
         serialized_msg = message.SerializeToString()
-        print(f"sending message -- len = {len(serialized_msg)} {str(serialized_msg)}")
+        print(f"sending message -- len = {len(serialized_msg)} {str(message)} {str(serialized_msg)}")
         write_int(0, self.sockfile)
         write_int(len(serialized_msg), self.sockfile)
         self.sockfile.write(serialized_msg)
