@@ -18,7 +18,10 @@
 package org.apache.spark.sql.execution.python
 
 import java.io.DataOutputStream
-import java.net.ServerSocket
+import java.net.StandardProtocolFamily
+import java.net.UnixDomainSocketAddress
+import java.nio.channels.ServerSocketChannel
+import java.nio.file.{Files, Path}
 import java.util.concurrent.TimeUnit
 
 import scala.concurrent.ExecutionContext
@@ -82,21 +85,26 @@ class TransformWithStateInPandasPythonRunner(
       inputIterator: Iterator[InType],
       partitionIndex: Int,
       context: TaskContext): Iterator[OutType] = {
-    var stateServerSocket: ServerSocket = null
+    // var stateServerSocket: ServerSocket = null
+    var serverChannel: ServerSocketChannel = null
 
     var failed = false
     try {
-      stateServerSocket = new ServerSocket( /* port = */0,
-        /* backlog = */1)
-      stateSocketSocketPort = stateServerSocket.getLocalPort
-      logWarning(s"opened socket on $stateSocketSocketPort")
+      // stateSocketSocketPort = stateServerSocket.getLocalPort
+
+      val socketFile = Path.of("./uds_socket")
+      Files.deleteIfExists(socketFile)
+      val uds_address = UnixDomainSocketAddress.of("./uds_socket")
+      serverChannel = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
+      serverChannel.bind(uds_address)
+      logWarning(s"opened socket on $uds_address")
     } catch {
       case e: Exception =>
         failed = true
         throw e
     } finally {
       if (failed) {
-        closeServerSocketChannelSilently(stateServerSocket)
+        closeServerSocketChannelSilently(serverChannel)
       }
     }
 
@@ -104,22 +112,22 @@ class TransformWithStateInPandasPythonRunner(
     val executionContext = ExecutionContext.fromExecutor(executor)
 
     executionContext.execute(
-      new TransformWithStateInPandasStateServer(stateServerSocket, processorHandle))
+      new TransformWithStateInPandasStateServer(serverChannel, processorHandle))
 
     context.addTaskCompletionListener[Unit] { _ =>
       logWarning(s"completion listener called")
       executor.awaitTermination(10, TimeUnit.SECONDS)
       executor.shutdownNow()
-      closeServerSocketChannelSilently(stateServerSocket)
+      closeServerSocketChannelSilently(serverChannel)
     }
 
     super.compute(inputIterator, partitionIndex, context)
   }
 
-  private def closeServerSocketChannelSilently(stateServerSocket: ServerSocket): Unit = {
+  private def closeServerSocketChannelSilently(socketChannel: ServerSocketChannel): Unit = {
     try {
       logWarning(s"closing the state server socket")
-      stateServerSocket.close()
+      socketChannel.close()
     } catch {
       case e: Exception =>
         logError(s"failed to close state server socket", e)

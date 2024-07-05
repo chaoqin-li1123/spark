@@ -17,8 +17,8 @@
 
 package org.apache.spark.sql.execution.python
 
-import java.io.{BufferedInputStream, BufferedOutputStream, DataInputStream, DataOutputStream}
-import java.net.ServerSocket
+import java.io.{DataInputStream, DataOutputStream}
+import java.nio.channels.{Channels, ServerSocketChannel}
 
 import scala.collection.mutable
 import scala.jdk.CollectionConverters.IterableHasAsJava
@@ -29,6 +29,7 @@ import org.apache.arrow.vector.ipc.ArrowStreamWriter
 import org.apache.arrow.vector.types.pojo.{Field, FieldType, Schema}
 import org.apache.arrow.vector.types.pojo.ArrowType.Utf8
 import org.apache.arrow.vector.util.Text
+import sun.nio.ch.ChannelInputStream
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.execution.streaming.{ImplicitGroupingKeyTracker, StatefulProcessorHandleImpl, StatefulProcessorHandleState}
@@ -36,8 +37,9 @@ import org.apache.spark.sql.execution.streaming.state.StateMessage.{HandleState,
 import org.apache.spark.sql.streaming.{ListState, ValueState}
 import org.apache.spark.sql.util.ArrowUtils
 
+
 class TransformWithStateInPandasStateServer(
-    private val stateServerSocket: ServerSocket,
+    private val socketChannel: ServerSocketChannel,
     private val statefulProcessorHandle: StatefulProcessorHandleImpl)
   extends Runnable
   with Logging{
@@ -63,16 +65,17 @@ class TransformWithStateInPandasStateServer(
 
   def run(): Unit = {
     logWarning(s"Waiting for connection from Python worker")
-    val listeningSocket = stateServerSocket.accept()
-    logWarning(s"listening on socket - ${listeningSocket.getLocalAddress}")
+    val channel = socketChannel.accept()
+    assert(channel.isConnected)
+    logWarning(s"read/write on channel - ${channel.getLocalAddress}")
 
     inputStream = new DataInputStream(
-      new BufferedInputStream(listeningSocket.getInputStream))
+      new ChannelInputStream(channel))
     outputStream = new DataOutputStream(
-      new BufferedOutputStream(listeningSocket.getOutputStream)
+      Channels.newOutputStream(channel)
     )
 
-    while (listeningSocket.isConnected &&
+    while (channel.isConnected &&
       statefulProcessorHandle.getHandleState != StatefulProcessorHandleState.CLOSED) {
 
       logWarning(s"reading the version")
