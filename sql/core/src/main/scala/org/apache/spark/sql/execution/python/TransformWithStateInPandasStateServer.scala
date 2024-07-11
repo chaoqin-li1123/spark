@@ -264,3 +264,12 @@ class TransformWithStateInPandasStateServer(
     }
   }
 }
+
+object TransformWithStateInPandasStateServer {
+  @volatile private var id = 0
+
+  def allocateServerId(): Int = synchronized {
+    id = id + 1
+    return id
+  }
+}

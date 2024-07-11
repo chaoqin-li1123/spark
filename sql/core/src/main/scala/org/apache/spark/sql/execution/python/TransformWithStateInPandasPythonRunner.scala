@@ -61,8 +61,6 @@ class TransformWithStateInPandasPythonRunner(
   private val sqlConf = SQLConf.get
   private val arrowMaxRecordsPerBatch = sqlConf.arrowMaxRecordsPerBatch
 
-  private var stateSocketSocketPort: Int = 0
-
   override protected val workerConf: Map[String, String] = initialWorkerConf +
     (SQLConf.ARROW_EXECUTION_MAX_RECORDS_PER_BATCH.key -> arrowMaxRecordsPerBatch.toString)
 
@@ -75,10 +73,12 @@ class TransformWithStateInPandasPythonRunner(
   override protected val errorOnDuplicatedFieldNames: Boolean = true
   override protected val largeVarTypes: Boolean = sqlConf.arrowUseLargeVarTypes
 
+  private val serverId = TransformWithStateInPandasStateServer.allocateServerId()
+
   override protected def handleMetadataBeforeExec(stream: DataOutputStream): Unit = {
     super.handleMetadataBeforeExec(stream)
     // Also write the port number for state server
-    stream.writeInt(stateSocketSocketPort)
+    stream.writeInt(serverId)
   }
 
   override def compute(
@@ -90,11 +90,11 @@ class TransformWithStateInPandasPythonRunner(
 
     var failed = false
     try {
-      // stateSocketSocketPort = stateServerSocket.getLocalPort
 
-      val socketFile = Path.of("./uds_socket")
+      val udsPath = s"./uds_socket_$serverId"
+      val socketFile = Path.of(udsPath)
       Files.deleteIfExists(socketFile)
-      val uds_address = UnixDomainSocketAddress.of("./uds_socket")
+      val uds_address = UnixDomainSocketAddress.of(udsPath)
       serverChannel = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
       serverChannel.bind(uds_address)
       logWarning(s"opened socket on $uds_address")

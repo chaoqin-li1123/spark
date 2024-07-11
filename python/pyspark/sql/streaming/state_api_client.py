@@ -37,9 +37,9 @@ class StatefulProcessorHandleState(Enum):
 class StateApiClient:
     def __init__(
         self,
-        state_server_port: int) -> None:
+        state_server_id: int) -> None:
         self._client_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server_address = './uds_socket'
+        server_address = f'./uds_socket_{state_server_id}'
         self._client_socket.connect(server_address)
         self.sockfile = self._client_socket.makefile("rwb", int(os.environ.get("SPARK_BUFFER_SIZE", 65536)))
         print(f"client is ready - connection established")
