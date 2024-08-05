@@ -19,6 +19,7 @@ package org.apache.spark.sql.execution.python
 
 import java.io.{DataInputStream, DataOutputStream, EOFException}
 import java.nio.channels.Channels
+import java.time.Duration
 
 import scala.collection.mutable
 
@@ -29,7 +30,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.{Encoder, Encoders, Row}
 import org.apache.spark.sql.execution.streaming.{ImplicitGroupingKeyTracker, StatefulProcessorHandleImpl, StatefulProcessorHandleState}
 import org.apache.spark.sql.execution.streaming.state.StateMessage.{HandleState, ImplicitGroupingKeyRequest, StatefulProcessorCall, StateRequest, StateResponse, StateVariableRequest, ValueStateCall}
-import org.apache.spark.sql.streaming.ValueState
+import org.apache.spark.sql.streaming.{TTLConfig, ValueState}
 import org.apache.spark.sql.types.{BooleanType, DataType, DoubleType, FloatType, IntegerType, LongType, StructType}
 
 /**
@@ -123,7 +124,10 @@ class TransformWithStateInPandasStateServer(
         val stateName = statefulProcessorHandleRequest.getGetValueState.getStateName
         val schema = statefulProcessorHandleRequest.getGetValueState.getSchema
         logWarning(s"initializing value state $stateName")
-        initializeState("ValueState", stateName, schema)
+        val ttlDurationMs = if (statefulProcessorHandleRequest.getGetValueState.hasTtl) {
+          Some(statefulProcessorHandleRequest.getGetValueState.getTtl.getDurationMs)
+        } else None
+        initializeState("ValueState", stateName, schema, ttlDurationMs)
       } else {
         throw new IllegalArgumentException("Invalid method call")
       }
@@ -132,7 +136,7 @@ class TransformWithStateInPandasStateServer(
         StateVariableRequest.MethodCase.VALUESTATECALL) {
         if (message.getStateVariableRequest.getValueStateCall.getMethodCase ==
           ValueStateCall.MethodCase.EXISTS) {
-          val stateName = message.getStateVariableRequest.getValueStateCall.getExists.getStateName
+          val stateName = message.getStateVariableRequest.getValueStateCall.getStateName
           if (valueStates.contains(stateName) && valueStates(stateName).exists()) {
             logWarning(s"state $stateName exists")
             sendResponse(0)
@@ -142,7 +146,7 @@ class TransformWithStateInPandasStateServer(
           }
         } else if (message.getStateVariableRequest.getValueStateCall.getMethodCase ==
           ValueStateCall.MethodCase.GET) {
-          val stateName = message.getStateVariableRequest.getValueStateCall.getGet.getStateName
+          val stateName = message.getStateVariableRequest.getValueStateCall.getStateName
           if (valueStates.contains(stateName)) {
             val valueState = valueStates(stateName)
             val valueOption = valueState.getOption()
@@ -165,9 +169,9 @@ class TransformWithStateInPandasStateServer(
             sendResponse(1, s"state $stateName doesn't exist")
           }
         } else if (message.getStateVariableRequest.getValueStateCall.getMethodCase ==
-          ValueStateCall.MethodCase.UPDATE) {
-          val updateRequest = message.getStateVariableRequest.getValueStateCall.getUpdate
-          val stateName = updateRequest.getStateName
+          ValueStateCall.MethodCase.VALUESTATEUPDATE) {
+          val updateRequest = message.getStateVariableRequest.getValueStateCall.getValueStateUpdate
+          val stateName = message.getStateVariableRequest.getValueStateCall.getStateName
           val updateValueString = updateRequest.getValue.toStringUtf8
           val dataType = StructType.fromString(updateRequest.getSchema).fields(0).dataType
           val updatedValue = castToType(updateValueString, dataType)
@@ -182,7 +186,7 @@ class TransformWithStateInPandasStateServer(
           }
         } else if (message.getStateVariableRequest.getValueStateCall.getMethodCase ==
           ValueStateCall.MethodCase.CLEAR) {
-          val stateName = message.getStateVariableRequest.getValueStateCall.getClear.getStateName
+          val stateName = message.getStateVariableRequest.getValueStateCall.getStateName
           if (valueStates.contains(stateName)) {
             valueStates(stateName).clear()
             sendResponse(0)
@@ -236,14 +240,24 @@ class TransformWithStateInPandasStateServer(
     outputStream.write(responseMessageBytes)
   }
 
-  private def initializeState(stateType: String, stateName: String, schema: String): Unit = {
+  private def initializeState(
+      stateType: String,
+      stateName: String,
+      schema: String,
+      ttlDurationMs: Option[Int]): Unit = {
     if (stateType == "ValueState") {
       if (!valueStates.contains(stateName)) {
         val structType = StructType.fromString(schema)
         val field = structType.fields(0)
         val encoder = getEncoder(field.dataType)
-        val state = statefulProcessorHandle.getValueState(stateName, encoder)
-          .asInstanceOf[ValueState[Any]]
+        val state = if (ttlDurationMs.isEmpty) {
+          statefulProcessorHandle.getValueState(stateName, encoder)
+            .asInstanceOf[ValueState[Any]]
+        } else {
+          statefulProcessorHandle
+            .getValueState(stateName, encoder, TTLConfig(Duration.ofMillis(ttlDurationMs.get)))
+            .asInstanceOf[ValueState[Any]]
+        }
         valueStates.put(stateName, state)
         sendResponse(0)
       } else {

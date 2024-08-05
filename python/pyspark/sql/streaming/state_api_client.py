@@ -88,7 +88,7 @@ class StateApiClient:
         if (status != 0):
             raise Exception(f"Error removing implicit key: {response_message.errorMessage}")
 
-    def get_value_state(self, state_name: str, schema: Union[StructType, str]) -> None:
+    def get_value_state(self, state_name: str, schema: Union[StructType, str], ttlDurationMs: int) -> None:
         if isinstance(schema, str):
             schema = cast(StructType, _parse_datatype_string(schema))
 
@@ -97,6 +97,8 @@ class StateApiClient:
         state_call_command = stateMessage.StateCallCommand()
         state_call_command.stateName = state_name
         state_call_command.schema = schema.json()
+        if ttlDurationMs is not None:
+            state_call_command.ttl.durationMs = ttlDurationMs
         call = stateMessage.StatefulProcessorCall(getValueState=state_call_command)
         message = stateMessage.StateRequest(statefulProcessorCall=call)
 

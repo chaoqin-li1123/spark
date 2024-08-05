@@ -37,9 +37,9 @@ private[sql] object InternalTimeModes {
     timeMode.toLowerCase(Locale.ROOT) match {
       case "none" =>
         TimeMode.None
-      case "processingTime" =>
+      case "processingtime" =>
         TimeMode.ProcessingTime
-      case "eventTime" =>
+      case "eventtime" =>
         TimeMode.EventTime
       case _ => throw new SparkIllegalArgumentException(
         errorClass = "STATEFUL_PROCESSOR_UNKNOWN_TIME_MODE",

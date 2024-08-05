@@ -788,7 +788,7 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
         val execPlan = TransformWithStateInPandasExec(
           func, groupingAttributes, outputAttrs, outputMode, timeMode,
           stateInfo = None,
-          batchTimestampMs = None,
+          batchTimestampMs = Some(System.currentTimeMillis()),
           eventTimeWatermarkForLateEvents = None,
           eventTimeWatermarkForEviction = None,
           planLater(child)

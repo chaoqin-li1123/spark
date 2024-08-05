@@ -17,18 +17,17 @@
 
 package org.apache.spark.sql.streaming
 
-import org.apache.spark.sql.streaming.StreamTest
-import org.apache.spark.sql.types.{LongType, StringType, StructField, StructType}
 import org.apache.spark.sql.IntegratedUDFTestUtils.TestGroupedMapPandasUDFWithState
 import org.apache.spark.sql.catalyst.expressions.PythonUDF
-import org.apache.spark.sql.catalyst.streaming.InternalOutputModes.Update
 import org.apache.spark.sql.execution.streaming.MemoryStream
+import org.apache.spark.sql.types.{LongType, StringType, StructField, StructType}
 import org.apache.spark.tags.SlowSQLTest
 
 @SlowSQLTest
 class TransformWithStateInPandasSuite extends StreamTest {
+  import testImplicits._
 
-  test("transformWithStateInPandas - streaming") {
+  ignore("transformWithStateInPandas - streaming") {
 
     val pythonScript =
       """

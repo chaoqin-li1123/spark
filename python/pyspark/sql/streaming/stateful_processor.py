@@ -31,7 +31,6 @@ from pyspark.sql.types import (
 if TYPE_CHECKING:
     from pyspark.sql.pandas._typing import DataFrameLike as PandasDataFrameLike
 
-
 class ValueState:
     def __init__(self,
             value_state_client: ValueStateClient,
@@ -80,7 +79,11 @@ class StatefulProcessorHandle:
         self.state_api_client = state_api_client
 
     def getValueState(self, state_name: str, schema: Union[StructType, str]) -> ValueState:
-        self.state_api_client.get_value_state(state_name, schema)
+        self.state_api_client.get_value_state(state_name, schema, None)
+        return ValueState(ValueStateClient(self.state_api_client), state_name, schema)
+
+    def getValueStateWithTTL(self, state_name: str, schema: Union[StructType, str], ttlDurationMs: int) -> ValueState:
+        self.state_api_client.get_value_state(state_name, schema, ttlDurationMs)
         return ValueState(ValueStateClient(self.state_api_client), state_name, schema)
 
 
