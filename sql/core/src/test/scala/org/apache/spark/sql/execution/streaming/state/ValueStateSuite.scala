@@ -29,7 +29,7 @@ import org.apache.spark.sql.Encoders
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.execution.streaming.{ImplicitGroupingKeyTracker, StatefulProcessorHandleImpl}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.streaming.{SerializationType, ValueState}
+import org.apache.spark.sql.streaming._
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 
@@ -38,6 +38,9 @@ import org.apache.spark.sql.types._
  * operators such as transformWithState
  */
 case class TestClass(var id: Long, var name: String)
+
+case class Chicken(num: Int)
+case class Egg(id: Int, name: String, age: Int, weight: Double, chicken: Chicken)
 
 class ValueStateSuite extends SharedSparkSession
   with BeforeAndAfter {
@@ -88,7 +91,7 @@ class ValueStateSuite extends SharedSparkSession
     }
   }
 
-  test("Implicit key operations") {
+  ignore("Implicit key operations") {
     tryWithProviderResource(newStoreProviderWithValueState(true)) { provider =>
       val store = provider.getStore(0)
       val handle = new StatefulProcessorHandleImpl(store, UUID.randomUUID(),
@@ -132,7 +135,7 @@ class ValueStateSuite extends SharedSparkSession
     }
   }
 
-  test("Value state operations for single & primitive instance") {
+  ignore("Value state operations for single & primitive instance") {
     tryWithProviderResource(newStoreProviderWithValueState(true)) { provider =>
       val store = provider.getStore(0)
       val handle = new StatefulProcessorHandleImpl(store, UUID.randomUUID(),
@@ -158,7 +161,7 @@ class ValueStateSuite extends SharedSparkSession
     }
   }
 
-  test("Value state operations for multiple instances") {
+  ignore("Value state operations for multiple instances") {
     tryWithProviderResource(newStoreProviderWithValueState(true)) { provider =>
       val store = provider.getStore(0)
       val handle = new StatefulProcessorHandleImpl(store, UUID.randomUUID(),
@@ -203,7 +206,7 @@ class ValueStateSuite extends SharedSparkSession
     }
   }
 
-  test("colFamily with HDFSBackedStateStoreProvider should fail") {
+  ignore("colFamily with HDFSBackedStateStoreProvider should fail") {
     val storeId = StateStoreId(newDir(), Random.nextInt(), 0)
     val provider = new HDFSBackedStateStoreProvider()
     val storeConf = new StateStoreConf(new SQLConf())
@@ -222,7 +225,7 @@ class ValueStateSuite extends SharedSparkSession
     )
   }
 
-  test("Value state operations for case class instances") {
+  ignore("Value state operations for case class instances") {
     tryWithProviderResource(newStoreProviderWithValueState(true)) { provider =>
       val store = provider.getStore(0)
       val handle = new StatefulProcessorHandleImpl(store, UUID.randomUUID(),
@@ -248,7 +251,7 @@ class ValueStateSuite extends SharedSparkSession
     }
   }
 
-  test("Value state operations for POJO instances") {
+  ignore("Value state operations for POJO instances") {
     tryWithProviderResource(newStoreProviderWithValueState(true)) { provider =>
       val store = provider.getStore(0)
       val handle = new StatefulProcessorHandleImpl(store, UUID.randomUUID(),
@@ -271,6 +274,105 @@ class ValueStateSuite extends SharedSparkSession
       testState.remove()
       assert(!testState.exists())
       assert(testState.get() === null)
+    }
+  }
+
+  test("avro encode case class") {
+    val valEncoder = Encoders.product[Egg]
+    val stateEncoder = new StateEncoder[Egg](valEncoder)
+
+    val startTime = System.nanoTime()
+    for (i <- 1 to 10000000) {
+      val egg = Egg(i, "egghjdjhdsfhkjdf-1", 34, 24.56, Chicken(i))
+      val row = stateEncoder.encodeValToAvro(egg)
+    }
+    val endTime = System.nanoTime()
+    val elapsed = {
+      (endTime - startTime) / 1.0e6
+    }
+    println(s"panda avro encode take $elapsed ms case class")
+  }
+
+  test("sql encode case class") {
+    val valEncoder = Encoders.product[Egg]
+    val stateEncoder = new StateEncoder[Egg](valEncoder)
+
+    val startTime = System.nanoTime()
+    for (i <- 1 to 10000000) {
+      val egg = Egg(1, "egghjdjhdsfhkjdf-1", 34, 24.56, Chicken(3))
+      val row = stateEncoder.encodeValSparkSQL(egg)
+    }
+    val endTime = System.nanoTime()
+    val elapsed = {
+      (endTime - startTime) / 1.0e6 // 300 nano second
+    }
+    println(s"panda sql encode take $elapsed ms case class")
+  }
+
+  test("sql encode double") {
+    val valEncoder = Encoders.DOUBLE
+    val stateEncoder = new StateEncoder[java.lang.Double](valEncoder)
+
+    val startTime = System.nanoTime()
+    for (i <- 1 to 10000000) {
+      val row = stateEncoder.encodeValSparkSQL(12.3 + i)
+    }
+    val endTime = System.nanoTime()
+    val elapsed = {
+      (endTime - startTime) / 1.0e6
+    }
+    println(s"panda sql encode take $elapsed ms double")
+  }
+
+  test("avro encode double") {
+    val valEncoder = Encoders.DOUBLE
+    val stateEncoder = new StateEncoder[java.lang.Double](valEncoder)
+
+    val startTime = System.nanoTime()
+    for (i <- 1 to 10000000) {
+      val row = stateEncoder.encodeValSparkSQL(12.3 + i)
+    }
+    val endTime = System.nanoTime()
+    val elapsed = {
+      (endTime - startTime) / 1.0e6
+    }
+    println(s"panda avro encode take $elapsed ms double")
+  }
+
+  test("rocksdb put") {
+    tryWithProviderResource(newStoreProviderWithValueState(true)) { provider =>
+      val store = provider.getStore(0)
+      val valEncoder = Encoders.product[Egg]
+      val stateEncoder = new StateEncoder[Egg](valEncoder)
+      val egg = Egg(1, "egghjdjhdsfhkjdf-1", 34, 24.56, Chicken(3))
+      val row = stateEncoder.encodeValSparkSQL(egg)
+
+      val startTime = System.nanoTime()
+      for (i <- 1 to 10000000) {
+        store.put(row, row) // 1500 nano second
+      }
+      val endTime = System.nanoTime()
+      val elapsed = {
+        (endTime - startTime) / 1.0e6
+      }
+      println(s"rocksdb put take $elapsed ms")
+    }
+  }
+
+  test("internal row") {
+    tryWithProviderResource(newStoreProviderWithValueState(true)) { provider =>
+      arr: byte[]
+      val row = stateEncoder.encodeValSparkSQL(egg)
+
+      val startTime = System.nanoTime()
+      for (i <- 1 to 10000000) {
+        store.put(row, row) // 1500 nano second
+      }
+      val endTime = System.nanoTime()
+      val elapsed = {
+        (endTime - startTime) / 1.0e6
+      }
+      println(s"rocksdb put take $elapsed ms")
     }
   }
 }

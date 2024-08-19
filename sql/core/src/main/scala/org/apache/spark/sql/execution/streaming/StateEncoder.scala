@@ -29,7 +29,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.encoders.{encoderFor, ExpressionEncoder}
 import org.apache.spark.sql.catalyst.expressions.{SpecificInternalRow, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.core.avro.{AvroDeserializer, AvroOptions, AvroSerializer, SchemaConverters}
-import org.apache.spark.sql.execution.streaming.ImplicitGroupingKeyTracker
+import org.apache.spark.sql.execution.streaming.{FastByteArrayOutputStream, ImplicitGroupingKeyTracker}
 import org.apache.spark.sql.execution.streaming.state.StateStoreErrors
 import org.apache.spark.sql.types.{BinaryType, StructType}
 
@@ -51,10 +51,25 @@ class StateEncoder[S](valEnc: Encoder[S]) {
   /** Variables reused for conversions between spark sql and avro */
   private val reuseRow = new UnsafeRow(valEnc.schema.fields.length)
   private var encoder: BinaryEncoder = _
-  private val out = new ByteArrayOutputStream
+  private val slowout = new ByteArrayOutputStream(128)
+  private val out = new FastByteArrayOutputStream
   private var decoder: BinaryDecoder = _
   private var result: Any = _
   val valSchema: StructType = valEnc.schema
+  val parser = new Schema.Parser()
+  val schemaStr =
+    """
+      |{"namespace": "org.apache.spark.sql.execution.streaming.state",
+      |  "type": "Egg",
+      |  "name": "Egg",
+      |  "fields": [
+      |    {"name": "id", "type": "int"},
+      |    {"name": "name", "type": "string"},
+      |    {"name": "age", "type": "int"},
+      |    {"name": "weight", "type": "double"}
+      |  ]
+      |}
+      |""".stripMargin
   // dataType -> avroType
   val avroType: Schema = SchemaConverters.toAvroType(valSchema)
   /** Serializer */
@@ -109,25 +124,43 @@ class StateEncoder[S](valEnc: Encoder[S]) {
     value
   }
 
+  var objectRow: InternalRow = null
+  var avroData: Any = null
+  var avroBinary: Array[Byte] = null
+  var internalRow: InternalRow = null
+  var unsafeRow: UnsafeRow = null
+
+  // 3250ms
   def encodeValToAvro(value: S): UnsafeRow = {
-    val objRow: InternalRow = objToRowSerializer.apply(value)
+    // 350 ms
+    if (objectRow == null || true) objectRow = objToRowSerializer.apply(value)
 
     /** The following parts are avro specific */
-    out.reset()
-    val avroData = avroSerializer.serialize(objRow)
-    writer.write(avroData, encoder)
-    encoder.flush()
-    // avro bytes
-    val binary: Array[Byte] = out.toByteArray
+    // 750 ms
+    if (avroData == null || true) avroData = avroSerializer.serialize(objectRow)
+    // 900 ms
+    if (avroBinary == null || true) {
+      out.reset()
+      writer.write(avroData, encoder)
+      encoder.flush()
+      // 700 ms
+      // avro bytes
+      if (avroBinary == null || true) avroBinary = out.toByteArray
+    }
+    // 400 ms
     /** Avro specific parts end here */
-
     // bytes -> InternalRow
-    valueRowEncoder(InternalRow(binary))
+    if (internalRow == null || true) {
+      internalRow = InternalRow(avroBinary)
+    }
+
+    unsafeRow = valueRowEncoder(internalRow)
+    unsafeRow
   }
 
   def decodeAvroToValue(row: UnsafeRow): S = {
     // InternalRow -> bytes
-    val avroBytes = row.getBinary(0)
+    val avroBytes = row.getBinary(0) // avoid copy
 
     /** The following parts are avro specific */
     decoder = DecoderFactory.get().binaryDecoder(avroBytes, 0, avroBytes.length, decoder)
