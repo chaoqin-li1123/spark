@@ -26,7 +26,9 @@ import org.scalatest.BeforeAndAfter
 
 import org.apache.spark.SparkException
 import org.apache.spark.sql.Encoders
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
+import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
 import org.apache.spark.sql.execution.streaming.{ImplicitGroupingKeyTracker, StatefulProcessorHandleImpl}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming._
@@ -361,18 +363,18 @@ class ValueStateSuite extends SharedSparkSession
 
   test("internal row") {
     tryWithProviderResource(newStoreProviderWithValueState(true)) { provider =>
-      arr: byte[]
-      val row = stateEncoder.encodeValSparkSQL(egg)
-
+      val arr = Array[Byte](1, 2, 3, 2, 3, 5, 6, 7, 8, 90, 2, 28)
+      val row = new GenericInternalRow(Array[Any](arr))
       val startTime = System.nanoTime()
       for (i <- 1 to 10000000) {
-        store.put(row, row) // 1500 nano second
+        val row = InternalRow(arr)
+        // val egg = Egg(i, "egghjdjhdsfhkjdf-1", 34, 24.56, Chicken(3))
       }
       val endTime = System.nanoTime()
       val elapsed = {
         (endTime - startTime) / 1.0e6
       }
-      println(s"rocksdb put take $elapsed ms")
+      println(s"create internal row take $elapsed ms")
     }
   }
 }

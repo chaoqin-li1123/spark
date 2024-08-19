@@ -27,7 +27,7 @@ import org.apache.commons.lang3.SerializationUtils
 import org.apache.spark.sql.Encoder
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.encoders.{encoderFor, ExpressionEncoder}
-import org.apache.spark.sql.catalyst.expressions.{SpecificInternalRow, UnsafeProjection, UnsafeRow}
+import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, SpecificInternalRow, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.core.avro.{AvroDeserializer, AvroOptions, AvroSerializer, SchemaConverters}
 import org.apache.spark.sql.execution.streaming.{FastByteArrayOutputStream, ImplicitGroupingKeyTracker}
 import org.apache.spark.sql.execution.streaming.state.StateStoreErrors
@@ -151,7 +151,8 @@ class StateEncoder[S](valEnc: Encoder[S]) {
     /** Avro specific parts end here */
     // bytes -> InternalRow
     if (internalRow == null || true) {
-      internalRow = InternalRow(avroBinary)
+      internalRow = new GenericInternalRow(Array[Any](avroBinary))
+      // internalRow = InternalRow(avroBinary)
     }
 
     unsafeRow = valueRowEncoder(internalRow)
