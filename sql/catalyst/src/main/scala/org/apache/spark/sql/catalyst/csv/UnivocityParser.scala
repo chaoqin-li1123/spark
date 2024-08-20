@@ -26,10 +26,9 @@ import com.univocity.parsers.csv.CsvParser
 import org.apache.spark.SparkUpgradeException
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.{InternalRow, NoopFilters, OrderedFilters}
-import org.apache.spark.sql.catalyst.expressions.{Cast, EmptyRow, ExprUtils, GenericInternalRow, Literal}
+import org.apache.spark.sql.catalyst.expressions.{ExprUtils, GenericInternalRow}
 import org.apache.spark.sql.catalyst.util._
 import org.apache.spark.sql.catalyst.util.LegacyDateFormats.FAST_DATE_FORMAT
-import org.apache.spark.sql.catalyst.util.ResolveDefaultColumns._
 import org.apache.spark.sql.errors.{ExecutionErrors, QueryExecutionErrors}
 import org.apache.spark.sql.internal.{LegacyBehaviorPolicy, SQLConf}
 import org.apache.spark.sql.sources.Filter
@@ -64,15 +63,13 @@ class UnivocityParser(
   private type ValueConverter = String => Any
 
   // This index is used to reorder parsed tokens
-  private val tokenIndexArr =
-    requiredSchema.map(f => java.lang.Integer.valueOf(dataSchema.indexOf(f))).toArray
+  private val tokenIndexArr = requiredSchema.map(f => dataSchema.indexOf(f)).toArray
 
   // True if we should inform the Univocity CSV parser to select which fields to read by their
   // positions. Generally assigned by input configuration options, except when input column(s) have
   // default values, in which case we omit the explicit indexes in order to know how many tokens
   // were present in each line instead.
-  private def columnPruning: Boolean = options.isColumnPruningEnabled &&
-    !requiredSchema.exists(_.metadata.contains(EXISTS_DEFAULT_COLUMN_METADATA_KEY))
+  private def columnPruning: Boolean = options.isColumnPruningEnabled(requiredSchema)
 
   // When column pruning is enabled, the parser only parses the required columns based on
   // their positions in the data schema.
@@ -83,7 +80,8 @@ class UnivocityParser(
     // When to-be-parsed schema is shorter than the to-be-read data schema, we let Univocity CSV
     // parser select a sequence of fields for reading by their positions.
     if (parsedSchema.length < dataSchema.length) {
-      parserSetting.selectIndexes(tokenIndexArr: _*)
+      // Box into Integer here to avoid unboxing where `tokenIndexArr` is used during parsing
+      parserSetting.selectIndexes(tokenIndexArr.map(java.lang.Integer.valueOf(_)): _*)
     }
     new CsvParser(parserSetting)
   }
@@ -138,6 +136,7 @@ class UnivocityParser(
 
   // Retrieve the raw record string.
   private def getCurrentInput: UTF8String = {
+    if (tokenizer.getContext == null) return null
     val currentContent = tokenizer.getContext.currentParsedContent()
     if (currentContent == null) null else UTF8String.fromString(currentContent.stripLineEnd)
   }
@@ -254,6 +253,9 @@ class UnivocityParser(
     case _: StringType => (d: String) =>
       nullSafeDatum(d, name, nullable, options)(UTF8String.fromString)
 
+    case _: BinaryType => (d: String) =>
+      nullSafeDatum(d, name, nullable, options)(_.getBytes)
+
     case CalendarIntervalType => (d: String) =>
       nullSafeDatum(d, name, nullable, options) { datum =>
         IntervalUtils.safeStringToInterval(UTF8String.fromString(datum))
@@ -261,12 +263,14 @@ class UnivocityParser(
 
     case ym: YearMonthIntervalType => (d: String) =>
       nullSafeDatum(d, name, nullable, options) { datum =>
-        Cast(Literal(datum), ym).eval(EmptyRow)
+        IntervalUtils.castStringToYMInterval(
+          UTF8String.fromString(datum), ym.startField, ym.endField)
       }
 
     case dt: DayTimeIntervalType => (d: String) =>
       nullSafeDatum(d, name, nullable, options) { datum =>
-        Cast(Literal(datum), dt).eval(EmptyRow)
+        IntervalUtils.castStringToDTInterval(
+          UTF8String.fromString(datum), dt.startField, dt.endField)
       }
 
     case udt: UserDefinedType[_] =>
@@ -317,7 +321,7 @@ class UnivocityParser(
       throw BadRecordException(
         () => getCurrentInput,
         () => Array.empty,
-        QueryExecutionErrors.malformedCSVRecordError(""))
+        LazyBadRecordCauseWrapper(() => QueryExecutionErrors.malformedCSVRecordError("")))
     }
 
     val currentInput = getCurrentInput
@@ -327,7 +331,8 @@ class UnivocityParser(
       // However, we still have chance to parse some of the tokens. It continues to parses the
       // tokens normally and sets null when `ArrayIndexOutOfBoundsException` occurs for missing
       // tokens.
-      Some(QueryExecutionErrors.malformedCSVRecordError(currentInput.toString))
+      Some(LazyBadRecordCauseWrapper(
+        () => QueryExecutionErrors.malformedCSVRecordError(currentInput.toString)))
     } else None
     // When the length of the returned tokens is identical to the length of the parsed schema,
     // we just need to:

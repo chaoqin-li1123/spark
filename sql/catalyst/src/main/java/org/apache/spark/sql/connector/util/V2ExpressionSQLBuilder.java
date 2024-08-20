@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.StringJoiner;
 
+import org.apache.spark.SparkIllegalArgumentException;
 import org.apache.spark.SparkUnsupportedOperationException;
 import org.apache.spark.sql.connector.expressions.Cast;
 import org.apache.spark.sql.connector.expressions.Expression;
@@ -64,7 +65,6 @@ public class V2ExpressionSQLBuilder {
       switch (c) {
         case '_' -> builder.append("\\_");
         case '%' -> builder.append("\\%");
-        case '\'' -> builder.append("\\\'");
         default -> builder.append(c);
       }
     }
@@ -78,7 +78,7 @@ public class V2ExpressionSQLBuilder {
     } else if (expr instanceof NamedReference namedReference) {
       return visitNamedReference(namedReference);
     } else if (expr instanceof Cast cast) {
-      return visitCast(build(cast.expression()), cast.dataType());
+      return visitCast(build(cast.expression()), cast.expressionDataType(), cast.dataType());
     } else if (expr instanceof Extract extract) {
       return visitExtract(extract.field(), build(extract.source()));
     } else if (expr instanceof SortOrder sortOrder) {
@@ -211,7 +211,7 @@ public class V2ExpressionSQLBuilder {
     return l + " LIKE '%" + escapeSpecialCharsForLikePattern(value) + "%' ESCAPE '\\'";
   }
 
-  private String inputToSQL(Expression input) {
+  protected String inputToSQL(Expression input) {
     if (input.children().length > 1) {
       return "(" + build(input) + ")";
     } else {
@@ -221,7 +221,8 @@ public class V2ExpressionSQLBuilder {
 
   protected String visitBinaryComparison(String name, String l, String r) {
     if (name.equals("<=>")) {
-      return "(" + l + " = " + r + ") OR (" + l + " IS NULL AND " + r + " IS NULL)";
+      return "((" + l + " IS NOT NULL AND " + r + " IS NOT NULL AND " + l + " = " + r + ") " +
+              "OR (" + l + " IS NULL AND " + r + " IS NULL))";
     }
     return l + " " + name + " " + r;
   }
@@ -230,8 +231,8 @@ public class V2ExpressionSQLBuilder {
     return l + " " + name + " " + r;
   }
 
-  protected String visitCast(String l, DataType dataType) {
-    return "CAST(" + l + " AS " + dataType.typeName() + ")";
+  protected String visitCast(String expr, DataType exprDataType, DataType targetDataType) {
+    return "CAST(" + expr + " AS " + targetDataType.typeName() + ")";
   }
 
   protected String visitAnd(String name, String l, String r) {
@@ -305,7 +306,8 @@ public class V2ExpressionSQLBuilder {
   }
 
   protected String visitUnexpectedExpr(Expression expr) throws IllegalArgumentException {
-    throw new IllegalArgumentException("Unexpected V2 expression: " + expr);
+    throw new SparkIllegalArgumentException(
+      "_LEGACY_ERROR_TEMP_3207", Map.of("expr", String.valueOf(expr)));
   }
 
   protected String visitOverlay(String[] inputs) {
@@ -354,7 +356,7 @@ public class V2ExpressionSQLBuilder {
     return joiner.toString();
   }
 
-  private String[] expressionsToStringArray(Expression[] expressions) {
+  protected String[] expressionsToStringArray(Expression[] expressions) {
     String[] result = new String[expressions.length];
     for (int i = 0; i < expressions.length; i++) {
       result[i] = build(expressions[i]);

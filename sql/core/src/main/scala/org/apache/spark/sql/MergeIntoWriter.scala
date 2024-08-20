@@ -32,11 +32,17 @@ import org.apache.spark.sql.functions.expr
  * @param table the name of the target table for the merge operation.
  * @param ds the source Dataset to merge into the target table.
  * @param on the merge condition.
+ * @param schemaEvolutionEnabled whether to enable automatic schema evolution for this merge
+ *                               operation. Default is `false`.
  *
  * @since 4.0.0
  */
 @Experimental
-class MergeIntoWriter[T] private[sql] (table: String, ds: Dataset[T], on: Column) {
+class MergeIntoWriter[T] private[sql] (
+    table: String,
+    ds: Dataset[T],
+    on: Column,
+    private[sql] val schemaEvolutionEnabled: Boolean = false) {
 
   private val df: DataFrame = ds.toDF()
 
@@ -161,6 +167,17 @@ class MergeIntoWriter[T] private[sql] (table: String, ds: Dataset[T], on: Column
   }
 
   /**
+   * Enable automatic schema evolution for this merge operation.
+   * @return A `MergeIntoWriter` instance with schema evolution enabled.
+   */
+  def withSchemaEvolution(): MergeIntoWriter[T] = {
+    new MergeIntoWriter[T](this.table, this.ds, this.on, schemaEvolutionEnabled = true)
+      .withNewMatchedActions(this.matchedActions: _*)
+      .withNewNotMatchedActions(this.notMatchedActions: _*)
+      .withNewNotMatchedBySourceActions(this.notMatchedBySourceActions: _*)
+  }
+
+  /**
    * Executes the merge operation.
    */
   def merge(): Unit = {
@@ -176,23 +193,24 @@ class MergeIntoWriter[T] private[sql] (table: String, ds: Dataset[T], on: Column
       on.expr,
       matchedActions,
       notMatchedActions,
-      notMatchedBySourceActions)
+      notMatchedBySourceActions,
+      schemaEvolutionEnabled)
     val qe = sparkSession.sessionState.executePlan(merge)
     qe.assertCommandExecuted()
   }
 
-  private[sql] def withNewMatchedAction(action: MergeAction): MergeIntoWriter[T] = {
-    this.matchedActions = this.matchedActions :+ action
+  private[sql] def withNewMatchedActions(actions: MergeAction*): MergeIntoWriter[T] = {
+    this.matchedActions ++= actions
     this
   }
 
-  private[sql] def withNewNotMatchedAction(action: MergeAction): MergeIntoWriter[T] = {
-    this.notMatchedActions = this.notMatchedActions :+ action
+  private[sql] def withNewNotMatchedActions(actions: MergeAction*): MergeIntoWriter[T] = {
+    this.notMatchedActions ++= actions
     this
   }
 
-  private[sql] def withNewNotMatchedBySourceAction(action: MergeAction): MergeIntoWriter[T] = {
-    this.notMatchedBySourceActions = this.notMatchedBySourceActions :+ action
+  private[sql] def withNewNotMatchedBySourceActions(actions: MergeAction*): MergeIntoWriter[T] = {
+    this.notMatchedBySourceActions ++= actions
     this
   }
 }
@@ -219,7 +237,7 @@ case class WhenMatched[T] private[sql](
    * @return The MergeIntoWriter instance with the update all action configured.
    */
   def updateAll(): MergeIntoWriter[T] = {
-    mergeIntoWriter.withNewMatchedAction(UpdateStarAction(condition))
+    mergeIntoWriter.withNewMatchedActions(UpdateStarAction(condition))
   }
 
   /**
@@ -230,7 +248,7 @@ case class WhenMatched[T] private[sql](
    * @return The MergeIntoWriter instance with the update action configured.
    */
   def update(map: Map[String, Column]): MergeIntoWriter[T] = {
-    mergeIntoWriter.withNewMatchedAction(
+    mergeIntoWriter.withNewMatchedActions(
       UpdateAction(condition, map.map(x => Assignment(expr(x._1).expr, x._2.expr)).toSeq))
   }
 
@@ -240,7 +258,7 @@ case class WhenMatched[T] private[sql](
    * @return The MergeIntoWriter instance with the delete action configured.
    */
   def delete(): MergeIntoWriter[T] = {
-    mergeIntoWriter.withNewMatchedAction(DeleteAction(condition))
+    mergeIntoWriter.withNewMatchedActions(DeleteAction(condition))
   }
 }
 
@@ -266,7 +284,7 @@ case class WhenNotMatched[T] private[sql](
    * @return The MergeIntoWriter instance with the insert all action configured.
    */
   def insertAll(): MergeIntoWriter[T] = {
-    mergeIntoWriter.withNewNotMatchedAction(InsertStarAction(condition))
+    mergeIntoWriter.withNewNotMatchedActions(InsertStarAction(condition))
   }
 
   /**
@@ -277,7 +295,7 @@ case class WhenNotMatched[T] private[sql](
    * @return The MergeIntoWriter instance with the insert action configured.
    */
   def insert(map: Map[String, Column]): MergeIntoWriter[T] = {
-    mergeIntoWriter.withNewNotMatchedAction(
+    mergeIntoWriter.withNewNotMatchedActions(
       InsertAction(condition, map.map(x => Assignment(expr(x._1).expr, x._2.expr)).toSeq))
   }
 }
@@ -302,7 +320,7 @@ case class WhenNotMatchedBySource[T] private[sql](
    * @return The MergeIntoWriter instance with the update all action configured.
    */
   def updateAll(): MergeIntoWriter[T] = {
-    mergeIntoWriter.withNewNotMatchedBySourceAction(UpdateStarAction(condition))
+    mergeIntoWriter.withNewNotMatchedBySourceActions(UpdateStarAction(condition))
   }
 
   /**
@@ -313,7 +331,7 @@ case class WhenNotMatchedBySource[T] private[sql](
    * @return The MergeIntoWriter instance with the update action configured.
    */
   def update(map: Map[String, Column]): MergeIntoWriter[T] = {
-    mergeIntoWriter.withNewNotMatchedBySourceAction(
+    mergeIntoWriter.withNewNotMatchedBySourceActions(
       UpdateAction(condition, map.map(x => Assignment(expr(x._1).expr, x._2.expr)).toSeq))
   }
 
@@ -324,6 +342,6 @@ case class WhenNotMatchedBySource[T] private[sql](
    * @return The MergeIntoWriter instance with the delete action configured.
    */
   def delete(): MergeIntoWriter[T] = {
-    mergeIntoWriter.withNewNotMatchedBySourceAction(DeleteAction(condition))
+    mergeIntoWriter.withNewNotMatchedBySourceActions(DeleteAction(condition))
   }
 }

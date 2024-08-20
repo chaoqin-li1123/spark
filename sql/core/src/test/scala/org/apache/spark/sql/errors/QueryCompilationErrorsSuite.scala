@@ -17,18 +17,19 @@
 
 package org.apache.spark.sql.errors
 
+import java.util.IllegalFormatException
+
 import org.apache.spark.{SPARK_DOC_ROOT, SparkIllegalArgumentException, SparkUnsupportedOperationException}
 import org.apache.spark.sql._
 import org.apache.spark.sql.api.java.{UDF1, UDF2, UDF23Test}
 import org.apache.spark.sql.catalyst.expressions.{Coalesce, Literal, UnsafeRow}
 import org.apache.spark.sql.catalyst.parser.ParseException
-import org.apache.spark.sql.execution.datasources.v2.jdbc.JDBCTableCatalog
+import org.apache.spark.sql.execution.datasources.parquet.SparkToParquetSchemaConverter
 import org.apache.spark.sql.expressions.SparkUserDefinedFunction
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
-import org.apache.spark.util.Utils
 
 case class StringLongClass(a: String, b: Long)
 
@@ -128,6 +129,11 @@ class QueryCompilationErrorsSuite
           "functionName" -> "`format_string`"),
         context = ExpectedContext(
           fragment = "format_string('%0$s', 'Hello')", start = 7, stop = 36))
+    }
+    withSQLConf(SQLConf.ALLOW_ZERO_INDEX_IN_FORMAT_STRING.key -> "true") {
+      intercept[IllegalFormatException] {
+        sql("select format_string('%0$s', 'Hello')").collect()
+      }
     }
   }
 
@@ -647,18 +653,6 @@ class QueryCompilationErrorsSuite
       parameters = Map("expression" -> "\"(explode(array(1, 2, 3)) + 1)\""))
   }
 
-  test("UNSUPPORTED_GENERATOR: only one generator allowed") {
-    val e = intercept[AnalysisException](
-      sql("""select explode(Array(1, 2, 3)), explode(Array(1, 2, 3))""").collect()
-    )
-
-    checkError(
-      exception = e,
-      errorClass = "UNSUPPORTED_GENERATOR.MULTI_GENERATOR",
-      parameters = Map("clause" -> "SELECT", "num" -> "2",
-        "generators" -> "\"explode(array(1, 2, 3))\", \"explode(array(1, 2, 3))\""))
-  }
-
   test("UNSUPPORTED_GENERATOR: generators are not supported outside the SELECT clause") {
     val e = intercept[AnalysisException](
       sql("""select 1 from t order by explode(Array(1, 2, 3))""").collect()
@@ -821,78 +815,6 @@ class QueryCompilationErrorsSuite
       parameters = Map("extraction" -> "\"array(test)\""))
   }
 
-  test("CREATE NAMESPACE with LOCATION for JDBC catalog should throw an error") {
-    withTempDir { tempDir =>
-      val url = s"jdbc:h2:${tempDir.getCanonicalPath};user=testUser;password=testPass"
-      Utils.classForName("org.h2.Driver")
-      withSQLConf(
-        "spark.sql.catalog.h2" -> classOf[JDBCTableCatalog].getName,
-        "spark.sql.catalog.h2.url" -> url,
-        "spark.sql.catalog.h2.driver" -> "org.h2.Driver") {
-        checkError(
-          exception = intercept[AnalysisException] {
-            sql("CREATE NAMESPACE h2.test_namespace LOCATION './samplepath'")
-          },
-          errorClass = "NOT_SUPPORTED_IN_JDBC_CATALOG.COMMAND",
-          sqlState = "0A000",
-          parameters = Map("cmd" -> toSQLStmt("CREATE NAMESPACE ... LOCATION ...")))
-      }
-    }
-  }
-
-  test("ALTER NAMESPACE with property other than COMMENT " +
-    "for JDBC catalog should throw an exception") {
-    withTempDir { tempDir =>
-      val url = s"jdbc:h2:${tempDir.getCanonicalPath};user=testUser;password=testPass"
-      Utils.classForName("org.h2.Driver")
-      withSQLConf(
-        "spark.sql.catalog.h2" -> classOf[JDBCTableCatalog].getName,
-        "spark.sql.catalog.h2.url" -> url,
-        "spark.sql.catalog.h2.driver" -> "org.h2.Driver") {
-        val namespace = "h2.test_namespace"
-        withNamespace(namespace) {
-          sql(s"CREATE NAMESPACE $namespace")
-          checkError(
-            exception = intercept[AnalysisException] {
-              sql(s"ALTER NAMESPACE h2.test_namespace SET LOCATION '/tmp/loc_test_2'")
-            },
-            errorClass = "NOT_SUPPORTED_IN_JDBC_CATALOG.COMMAND_WITH_PROPERTY",
-            sqlState = "0A000",
-            parameters = Map(
-              "cmd" -> toSQLStmt("SET NAMESPACE"),
-              "property" -> toSQLConf("location")))
-
-          checkError(
-            exception = intercept[AnalysisException] {
-              sql(s"ALTER NAMESPACE h2.test_namespace SET PROPERTIES('a'='b')")
-            },
-            errorClass = "NOT_SUPPORTED_IN_JDBC_CATALOG.COMMAND_WITH_PROPERTY",
-            sqlState = "0A000",
-            parameters = Map(
-              "cmd" -> toSQLStmt("SET NAMESPACE"),
-              "property" -> toSQLConf("a")))
-        }
-      }
-    }
-  }
-
-  test("ALTER TABLE UNSET nonexistent property should throw an exception") {
-    val tableName = "test_table"
-    withTable(tableName) {
-      sql(s"CREATE TABLE $tableName (a STRING, b INT) USING parquet")
-
-      checkError(
-        exception = intercept[AnalysisException] {
-          sql(s"ALTER TABLE $tableName UNSET TBLPROPERTIES ('test_prop1', 'test_prop2', 'comment')")
-        },
-        errorClass = "UNSET_NONEXISTENT_PROPERTIES",
-        parameters = Map(
-          "properties" -> "`test_prop1`, `test_prop2`",
-          "table" -> "`spark_catalog`.`default`.`test_table`")
-      )
-    }
-  }
-
   test("SPARK-43841: Unresolved attribute in select of full outer join with USING") {
     withTempView("v1", "v2") {
       sql("create or replace temp view v1 as values (1, 2) as (c1, c2)")
@@ -950,10 +872,59 @@ class QueryCompilationErrorsSuite
       exception = intercept[SparkUnsupportedOperationException] {
         new UnsafeRow(1).update(0, 1)
       },
-      errorClass = "UNSUPPORTED_CALL",
+      errorClass = "UNSUPPORTED_CALL.WITHOUT_SUGGESTION",
       parameters = Map(
         "methodName" -> "update",
         "className" -> "org.apache.spark.sql.catalyst.expressions.UnsafeRow"))
+  }
+
+  test("INTERNAL_ERROR: Convert unsupported data type from Spark to Parquet") {
+    val converter = new SparkToParquetSchemaConverter
+    val dummyDataType = new DataType {
+      override def defaultSize: Int = 0
+
+      override def simpleString: String = "Dummy"
+
+      override private[spark] def asNullable = NullType
+    }
+    checkError(
+      exception = intercept[AnalysisException] {
+        converter.convertField(StructField("test", dummyDataType))
+      },
+      errorClass = "INTERNAL_ERROR",
+      parameters = Map("message" -> "Cannot convert Spark data type \"DUMMY\" to any Parquet type.")
+    )
+  }
+
+  test("SPARK-48556: Ensure UNRESOLVED_COLUMN is thrown when query has grouping expressions " +
+      "with invalid column name") {
+    case class UnresolvedDummyColumnTest(query: String, pos: Int)
+
+    withTable("t1") {
+      sql("create table t1(a int, b int) using parquet")
+      val tests = Seq(
+        UnresolvedDummyColumnTest("select grouping(a), dummy from t1 group by a with rollup", 20),
+        UnresolvedDummyColumnTest("select dummy, grouping(a) from t1 group by a with rollup", 7),
+        UnresolvedDummyColumnTest(
+          "select a, case when grouping(a) = 1 then 0 else b end, count(dummy) from t1 " +
+            "group by 1 with rollup",
+          61),
+        UnresolvedDummyColumnTest(
+          "select a, max(dummy), case when grouping(a) = 1 then 0 else b end " +
+            "from t1 group by 1 with rollup",
+          14)
+      )
+      tests.foreach(test => {
+        checkError(
+          exception = intercept[AnalysisException] {
+            sql(test.query)
+          },
+          errorClass = "UNRESOLVED_COLUMN.WITH_SUGGESTION",
+          parameters = Map("objectName" -> "`dummy`", "proposal" -> "`a`, `b`"),
+          context = ExpectedContext(fragment = "dummy", start = test.pos, stop = test.pos + 4)
+        )
+      })
+    }
   }
 }
 

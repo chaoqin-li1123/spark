@@ -19,28 +19,32 @@ package org.apache.spark.sql.connector
 
 import java.sql.Timestamp
 import java.time.{Duration, LocalDate, Period}
+import java.util
 import java.util.Locale
 
 import scala.concurrent.duration.MICROSECONDS
 import scala.jdk.CollectionConverters._
 
-import org.apache.spark.{SparkException, SparkUnsupportedOperationException}
+import org.apache.spark.{SparkException, SparkRuntimeException, SparkUnsupportedOperationException}
 import org.apache.spark.sql._
+import org.apache.spark.sql.catalyst.{FullQualifiedTableName, InternalRow, TableIdentifier}
 import org.apache.spark.sql.catalyst.CurrentUserContext.CURRENT_USER
-import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.analysis.{CannotReplaceMissingTableException, NoSuchDatabaseException, NoSuchNamespaceException, TableAlreadyExistsException}
+import org.apache.spark.sql.catalyst.analysis.{CannotReplaceMissingTableException, NoSuchNamespaceException, TableAlreadyExistsException}
+import org.apache.spark.sql.catalyst.catalog.{CatalogStorageFormat, CatalogTable, CatalogTableType, CatalogUtils}
 import org.apache.spark.sql.catalyst.parser.ParseException
-import org.apache.spark.sql.catalyst.plans.logical.ColumnStat
+import org.apache.spark.sql.catalyst.plans.logical.{AppendData, ColumnStat, CommandResult, OverwriteByExpression}
 import org.apache.spark.sql.catalyst.statsEstimation.StatsEstimationTestBase
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.connector.catalog.{Column => ColumnV2, _}
 import org.apache.spark.sql.connector.catalog.CatalogManager.SESSION_CATALOG_NAME
 import org.apache.spark.sql.connector.catalog.CatalogV2Util.withDefaultOwnership
-import org.apache.spark.sql.connector.expressions.LiteralValue
+import org.apache.spark.sql.connector.expressions.{LiteralValue, Transform}
 import org.apache.spark.sql.errors.QueryErrorsBase
 import org.apache.spark.sql.execution.FilterExec
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.columnar.InMemoryRelation
+import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanRelation
 import org.apache.spark.sql.execution.streaming.MemoryStream
 import org.apache.spark.sql.internal.{SQLConf, StaticSQLConf}
@@ -430,6 +434,25 @@ class DataSourceV2SQLSuiteV1Filter
     }
   }
 
+  test("SPARK-49152: CreateTable should store location as qualified") {
+    val tbl = "testcat.table_name"
+
+    def testWithLocation(location: String, qualified: String): Unit = {
+      withTable(tbl) {
+        sql(s"CREATE TABLE $tbl USING foo LOCATION '$location'")
+        val loc = catalog("testcat").asTableCatalog
+          .loadTable(Identifier.of(Array.empty, "table_name"))
+          .properties().get(TableCatalog.PROP_LOCATION)
+        assert(loc === qualified)
+      }
+    }
+
+    testWithLocation("/absolute/path", "file:/absolute/path")
+    testWithLocation("s3://host/full/path", "s3://host/full/path")
+    testWithLocation("relative/path", "relative/path")
+    testWithLocation("/path/special+ char", "file:/path/special+ char")
+  }
+
   test("SPARK-37545: CreateTableAsSelect should store location as qualified") {
     val basicIdentifier = "testcat.table_name"
     val atomicIdentifier = "testcat_atomic.table_name"
@@ -814,14 +837,10 @@ class DataSourceV2SQLSuiteV1Filter
         if (nullable) {
           insertNullValueAndCheck()
         } else {
-          // TODO assign a error-classes name
-          checkError(
-            exception = intercept[SparkException] {
-              insertNullValueAndCheck()
-            },
-            errorClass = null,
-            parameters = Map.empty
-          )
+          val exception = intercept[SparkRuntimeException] {
+            insertNullValueAndCheck()
+          }
+          assert(exception.getErrorClass == "NOT_NULL_ASSERT_VIOLATION")
         }
     }
   }
@@ -1355,8 +1374,7 @@ class DataSourceV2SQLSuiteV1Filter
             val identifier = Identifier.of(Array(), "reservedTest")
             val location = tableCatalog.loadTable(identifier).properties()
               .get(TableCatalog.PROP_LOCATION)
-            assert(location.startsWith("file:") && location.endsWith("foo"),
-              "path as a table property should not have side effects")
+            assert(location == "foo", "path as a table property should not have side effects")
             assert(tableCatalog.loadTable(identifier).properties().get("path") == "bar",
               "path as a table property should not have side effects")
             assert(tableCatalog.loadTable(identifier).properties().get("Path") == "noop",
@@ -1431,12 +1449,12 @@ class DataSourceV2SQLSuiteV1Filter
   }
 
   test("Use: v2 session catalog is used and namespace does not exist") {
-    val exception = intercept[NoSuchDatabaseException] {
+    val exception = intercept[AnalysisException] {
       sql("USE ns1")
     }
     checkError(exception,
       errorClass = "SCHEMA_NOT_FOUND",
-      parameters = Map("schemaName" -> "`ns1`"))
+      parameters = Map("schemaName" -> "`spark_catalog`.`ns1`"))
   }
 
   test("SPARK-31100: Use: v2 catalog that implements SupportsNamespaces is used " +
@@ -1447,7 +1465,7 @@ class DataSourceV2SQLSuiteV1Filter
     }
     checkError(exception,
       errorClass = "SCHEMA_NOT_FOUND",
-      parameters = Map("schemaName" -> "`ns1`.`ns2`"))
+      parameters = Map("schemaName" -> "`testcat`.`ns1`.`ns2`"))
   }
 
   test("SPARK-31100: Use: v2 catalog that does not implement SupportsNameSpaces is used " +
@@ -1731,6 +1749,24 @@ class DataSourceV2SQLSuiteV1Filter
              |) USING foo
              |""".stripMargin)
         assert(catalog("testcat").asTableCatalog.tableExists(Identifier.of(Array(), tblName)))
+      }
+    }
+  }
+
+  test("SPARK-46972: asymmetrical replacement for char/varchar in V2SessionCatalog.createTable") {
+    // unset this config to use the default v2 session catalog.
+    spark.conf.unset(V2_SESSION_CATALOG_IMPLEMENTATION.key)
+    withTable("t") {
+      sql(s"CREATE TABLE t(c char(1), v varchar(2)) USING $v2Source")
+    }
+  }
+
+  test("SPARK-48709: varchar resolution mismatch for DataSourceV2 CTAS") {
+    withSQLConf(
+      SQLConf.STORE_ASSIGNMENT_POLICY.key -> SQLConf.StoreAssignmentPolicy.LEGACY.toString) {
+      withTable("testcat.ns.t1", "testcat.ns.t2") {
+        sql("CREATE TABLE testcat.ns.t1 (d1 string, d2 varchar(200)) USING parquet")
+        sql("CREATE TABLE testcat.ns.t2 USING foo as select * from testcat.ns.t1")
       }
     }
   }
@@ -2089,15 +2125,10 @@ class DataSourceV2SQLSuiteV1Filter
   }
 
   test("REPLACE TABLE: v1 table") {
-    val e = intercept[AnalysisException] {
-      sql(s"CREATE OR REPLACE TABLE tbl (a int) USING ${classOf[SimpleScanSource].getName}")
-    }
-    checkError(
-      exception = e,
-      errorClass = "UNSUPPORTED_FEATURE.TABLE_OPERATION",
-      sqlState = "0A000",
-      parameters = Map("tableName" -> "`spark_catalog`.`default`.`tbl`",
-        "operation" -> "REPLACE TABLE"))
+    sql(s"CREATE OR REPLACE TABLE tbl (a int) USING ${classOf[SimpleScanSource].getName}")
+    val v2Catalog = catalog("spark_catalog").asTableCatalog
+    val table = v2Catalog.loadTable(Identifier.of(Array("default"), "tbl"))
+    assert(table.properties().get(TableCatalog.PROP_PROVIDER) == classOf[SimpleScanSource].getName)
   }
 
   test("DeleteFrom: - delete with invalid predicate") {
@@ -2363,10 +2394,9 @@ class DataSourceV2SQLSuiteV1Filter
     val t = "testcat.ns1.ns2.tbl"
     withTable(t) {
       spark.sql(s"CREATE TABLE $t (id bigint, data string) USING foo")
-
-      testNotSupportedV2Command("SHOW COLUMNS", s"FROM $t")
-      testNotSupportedV2Command("SHOW COLUMNS", s"IN $t")
-      testNotSupportedV2Command("SHOW COLUMNS", "FROM tbl IN testcat.ns1.ns2")
+      checkAnswer(sql(s"SHOW COLUMNS FROM $t IN testcat.ns1.ns2"), Seq(Row("id"), Row("data")))
+      checkAnswer(sql(s"SHOW COLUMNS in $t"), Seq(Row("id"), Row("data")))
+      checkAnswer(sql(s"SHOW COLUMNS FROM $t"), Seq(Row("id"), Row("data")))
     }
   }
 
@@ -2483,7 +2513,6 @@ class DataSourceV2SQLSuiteV1Filter
         verify(s"CACHE TABLE $t")
         verify(s"UNCACHE TABLE $t")
         verify(s"TRUNCATE TABLE $t")
-        verify(s"SHOW COLUMNS FROM $t")
       }
     }
 
@@ -2574,7 +2603,7 @@ class DataSourceV2SQLSuiteV1Filter
     checkError(
       exception = intercept[AnalysisException](sql("COMMENT ON NAMESPACE abc IS NULL")),
       errorClass = "SCHEMA_NOT_FOUND",
-      parameters = Map("schemaName" -> "`abc`"))
+      parameters = Map("schemaName" -> "`spark_catalog`.`abc`"))
 
     // V2 non-session catalog is used.
     sql("CREATE NAMESPACE testcat.ns1")
@@ -2584,7 +2613,7 @@ class DataSourceV2SQLSuiteV1Filter
     checkError(
       exception = intercept[AnalysisException](sql("COMMENT ON NAMESPACE testcat.abc IS NULL")),
       errorClass = "SCHEMA_NOT_FOUND",
-      parameters = Map("schemaName" -> "`abc`"))
+      parameters = Map("schemaName" -> "`testcat`.`abc`"))
   }
 
   private def checkNamespaceComment(namespace: String, comment: String): Unit = {
@@ -2832,19 +2861,12 @@ class DataSourceV2SQLSuiteV1Filter
         exception = intercept[AnalysisException] {
           sql(sql1)
         },
-        errorClass = "_LEGACY_ERROR_TEMP_1331",
+        errorClass = "UNRESOLVED_COLUMN.WITH_SUGGESTION",
+        sqlState = "42703",
         parameters = Map(
-          "fieldName" -> "non_exist",
-          "table" -> "testcat.tbl",
-          "schema" ->
-            """root
-              | |-- id: long (nullable = true)
-              | |-- data: string (nullable = true)
-              |""".stripMargin),
-        context = ExpectedContext(
-          fragment = sql1,
-          start = 0,
-          stop = 40))
+          "objectName" -> "`non_exist`",
+          "proposal" -> "`id`, `data`"),
+        context = ExpectedContext(fragment = sql1, start = 0, stop = 40))
 
       val sql2 = s"CREATE index i1 ON $t(id)"
       checkError(
@@ -2917,6 +2939,67 @@ class DataSourceV2SQLSuiteV1Filter
       partKeys = table.data.map(_.partitionKey().getInt(0))
       assert(partKeys.length == 5)
       assert(partKeys.toSet == Set(1, 2, 3, 4, 5))
+    }
+  }
+
+  test("Check HasPartitionStatistics from InMemoryPartitionTable") {
+    val t = "testpart.tbl"
+    withTable(t) {
+      sql(s"CREATE TABLE $t (id string) USING foo PARTITIONED BY (key int)")
+      val table = catalog("testpart").asTableCatalog
+        .loadTable(Identifier.of(Array(), "tbl"))
+        .asInstanceOf[InMemoryPartitionTable]
+
+      var partSizes = table.data.map(_.sizeInBytes().getAsLong)
+      var partRowCounts = table.data.map(_.numRows().getAsLong)
+      var partFiles = table.data.map(_.filesCount().getAsLong)
+      assert(partSizes.length == 0)
+      assert(partRowCounts.length == 0)
+      assert(partFiles.length == 0)
+
+      sql(s"INSERT INTO $t VALUES ('a', 1), ('b', 2), ('c', 3)")
+      partSizes = table.data.map(_.sizeInBytes().getAsLong)
+      assert(partSizes.length == 3)
+      assert(partSizes.toSet == Set(100, 100, 100))
+      partRowCounts = table.data.map(_.numRows().getAsLong)
+      assert(partRowCounts.length == 3)
+      assert(partRowCounts.toSet == Set(1, 1, 1))
+      partFiles = table.data.map(_.filesCount().getAsLong)
+      assert(partFiles.length == 3)
+      assert(partFiles.toSet == Set(100, 100, 100))
+
+      sql(s"ALTER TABLE $t DROP PARTITION (key=3)")
+      partSizes = table.data.map(_.sizeInBytes().getAsLong)
+      assert(partSizes.length == 2)
+      assert(partSizes.toSet == Set(100, 100))
+      partRowCounts = table.data.map(_.numRows().getAsLong)
+      assert(partRowCounts.length == 2)
+      assert(partRowCounts.toSet == Set(1, 1))
+      partFiles = table.data.map(_.filesCount().getAsLong)
+      assert(partFiles.length == 2)
+      assert(partFiles.toSet == Set(100, 100))
+
+      sql(s"ALTER TABLE $t ADD PARTITION (key=4)")
+      partSizes = table.data.map(_.sizeInBytes().getAsLong)
+      assert(partSizes.length == 3)
+      assert(partSizes.toSet == Set(100, 100, 100))
+      partRowCounts = table.data.map(_.numRows().getAsLong)
+      assert(partRowCounts.length == 3)
+      assert(partRowCounts.toSet == Set(1, 1, 0))
+      partFiles = table.data.map(_.filesCount().getAsLong)
+      assert(partFiles.length == 3)
+      assert(partFiles.toSet == Set(100, 100, 100))
+
+      sql(s"INSERT INTO $t VALUES ('c', 3), ('e', 5)")
+      partSizes = table.data.map(_.sizeInBytes().getAsLong)
+      assert(partSizes.length == 5)
+      assert(partSizes.toSet == Set(100, 100, 100, 100, 100))
+      partRowCounts = table.data.map(_.numRows().getAsLong)
+      assert(partRowCounts.length == 5)
+      assert(partRowCounts.toSet == Set(1, 1, 0, 1, 1))
+      partFiles = table.data.map(_.filesCount().getAsLong)
+      assert(partFiles.length == 5)
+      assert(partFiles.toSet == Set(100, 100, 100, 100, 100))
     }
   }
 
@@ -2997,6 +3080,19 @@ class DataSourceV2SQLSuiteV1Filter
 
       checkError(
         exception = intercept[AnalysisException] {
+          // `current_date()` is a valid expression for time travel timestamp, but the test uses
+          // a fake time travel implementation that only supports two hardcoded timestamp values.
+          sql("SELECT * FROM t TIMESTAMP AS OF current_date()")
+        },
+        errorClass = "TABLE_OR_VIEW_NOT_FOUND",
+        parameters = Map("relationName" -> "`t`"),
+        context = ExpectedContext(
+          fragment = "t",
+          start = 14,
+          stop = 14))
+
+      checkError(
+        exception = intercept[AnalysisException] {
           sql("SELECT * FROM t TIMESTAMP AS OF INTERVAL 1 DAY").collect()
         },
         errorClass = "INVALID_TIME_TRAVEL_TIMESTAMP_EXPR.INPUT",
@@ -3049,7 +3145,7 @@ class DataSourceV2SQLSuiteV1Filter
         sqlState = None,
         parameters = Map(
           "sqlExpr" -> "\"abs(true)\"",
-          "paramIndex" -> "1",
+          "paramIndex" -> "first",
           "inputSql" -> "\"true\"",
           "inputType" -> "\"BOOLEAN\"",
           "requiredType" ->
@@ -3203,7 +3299,7 @@ class DataSourceV2SQLSuiteV1Filter
       val properties = table.properties
       assert(properties.get(TableCatalog.PROP_PROVIDER) == "parquet")
       assert(properties.get(TableCatalog.PROP_COMMENT) == "This is a comment")
-      assert(properties.get(TableCatalog.PROP_LOCATION) == "file:///tmp")
+      assert(properties.get(TableCatalog.PROP_LOCATION) == "file:/tmp")
       assert(properties.containsKey(TableCatalog.PROP_OWNER))
       assert(properties.get(TableCatalog.PROP_EXTERNAL) == "true")
       assert(properties.get(s"${TableCatalog.OPTION_PREFIX}from") == "0")
@@ -3406,6 +3502,207 @@ class DataSourceV2SQLSuiteV1Filter
     }
   }
 
+  test("SPARK-48286: Add new column with default value which is not foldable") {
+    val foldableExpressions = Seq("1", "2 + 1")
+    withSQLConf(SQLConf.DEFAULT_COLUMN_ALLOWED_PROVIDERS.key -> v2Source) {
+      withTable("tab") {
+        spark.sql(s"CREATE TABLE tab (col1 INT DEFAULT 100) USING $v2Source")
+        val exception = intercept[AnalysisException] {
+          // Rand function is not foldable
+          spark.sql(s"ALTER TABLE tab ADD COLUMN col2 DOUBLE DEFAULT rand()")
+        }
+        assert(exception.getSqlState == "42623")
+        assert(exception.errorClass.get == "INVALID_DEFAULT_VALUE.NOT_CONSTANT")
+        assert(exception.messageParameters("colName") == "`col2`")
+        assert(exception.messageParameters("defaultValue") == "rand()")
+        assert(exception.messageParameters("statement") == "ALTER TABLE")
+      }
+      foldableExpressions.foreach(expr => {
+        withTable("tab") {
+          spark.sql(s"CREATE TABLE tab (col1 INT DEFAULT 100) USING $v2Source")
+          spark.sql(s"ALTER TABLE tab ADD COLUMN col2 DOUBLE DEFAULT $expr")
+        }
+      })
+    }
+  }
+
+  test("SPARK-49099: Switch current schema with custom spark_catalog") {
+    // Reset CatalogManager to clear the materialized `spark_catalog` instance, so that we can
+    // configure a new implementation.
+    spark.sessionState.catalogManager.reset()
+    withSQLConf(V2_SESSION_CATALOG_IMPLEMENTATION.key -> classOf[InMemoryCatalog].getName) {
+      sql("CREATE DATABASE test_db")
+      sql("USE test_db")
+    }
+  }
+
+
+  test("SPARK-36680: Supports Dynamic Table Options for Spark SQL") {
+    val t1 = s"${catalogAndNamespace}table"
+    withTable(t1) {
+      sql(s"CREATE TABLE $t1 (id bigint, data string) USING $v2Format")
+      sql(s"INSERT INTO $t1 VALUES (1, 'a'), (2, 'b')")
+
+      var df = sql(s"SELECT * FROM $t1")
+      var collected = df.queryExecution.optimizedPlan.collect {
+        case scan: DataSourceV2ScanRelation =>
+          assert(scan.relation.options.isEmpty)
+      }
+      assert (collected.size == 1)
+      checkAnswer(df, Seq(Row(1, "a"), Row(2, "b")))
+
+      df = sql(s"SELECT * FROM $t1 WITH (`split-size` = 5)")
+      collected = df.queryExecution.optimizedPlan.collect {
+        case scan: DataSourceV2ScanRelation =>
+          assert(scan.relation.options.get("split-size") == "5")
+      }
+      assert (collected.size == 1)
+      checkAnswer(df, Seq(Row(1, "a"), Row(2, "b")))
+
+      val noValues = intercept[AnalysisException](
+        sql(s"SELECT * FROM $t1 WITH (`split-size`)"))
+      assert(noValues.message.contains(
+        "Operation not allowed: Values must be specified for key(s): [split-size]"))
+    }
+  }
+
+  test("SPARK-36680: Supports Dynamic Table Options for Insert") {
+    val t1 = s"${catalogAndNamespace}table"
+    withTable(t1) {
+      sql(s"CREATE TABLE $t1 (id bigint, data string) USING $v2Format")
+      val df = sql(s"INSERT INTO $t1 WITH (`write.split-size` = 10) VALUES (1, 'a'), (2, 'b')")
+
+      val collected = df.queryExecution.optimizedPlan.collect {
+        case CommandResult(_, AppendData(relation: DataSourceV2Relation, _, _, _, _, _), _, _) =>
+          assert(relation.options.get("write.split-size") == "10")
+      }
+      assert (collected.size == 1)
+
+      val insertResult = sql(s"SELECT * FROM $t1")
+      checkAnswer(insertResult, Seq(Row(1, "a"), Row(2, "b")))
+    }
+  }
+
+  test("SPARK-36680: Supports Dynamic Table Options for Insert Overwrite") {
+    val t1 = s"${catalogAndNamespace}table"
+    withTable(t1) {
+      sql(s"CREATE TABLE $t1 (id bigint, data string) USING $v2Format")
+      sql(s"INSERT INTO $t1 WITH (`write.split-size` = 10) VALUES (1, 'a'), (2, 'b')")
+
+      val df = sql(s"INSERT OVERWRITE $t1 WITH (`write.split-size` = 10) " +
+        s"VALUES (3, 'c'), (4, 'd')")
+      val collected = df.queryExecution.optimizedPlan.collect {
+        case CommandResult(_,
+          OverwriteByExpression(relation: DataSourceV2Relation, _, _, _, _, _, _),
+          _, _) =>
+          assert(relation.options.get("write.split-size") == "10")
+      }
+      assert (collected.size == 1)
+
+      val insertResult = sql(s"SELECT * FROM $t1")
+      checkAnswer(insertResult, Seq(Row(3, "c"), Row(4, "d")))
+    }
+  }
+
+  test("SPARK-36680: Supports Dynamic Table Options for Insert Replace") {
+    val t1 = s"${catalogAndNamespace}table"
+    withTable(t1) {
+      sql(s"CREATE TABLE $t1 (id bigint, data string) USING $v2Format")
+      sql(s"INSERT INTO $t1 WITH (`write.split-size` = 10) VALUES (1, 'a'), (2, 'b')")
+
+      val df = sql(s"INSERT INTO $t1 WITH (`write.split-size` = 10) " +
+        s"REPLACE WHERE TRUE " +
+        s"VALUES (3, 'c'), (4, 'd')")
+      val collected = df.queryExecution.optimizedPlan.collect {
+        case CommandResult(_,
+          OverwriteByExpression(relation: DataSourceV2Relation, _, _, _, _, _, _),
+          _, _) =>
+          assert(relation.options.get("write.split-size") == "10")
+      }
+      assert (collected.size == 1)
+
+      val insertResult = sql(s"SELECT * FROM $t1")
+      checkAnswer(insertResult, Seq(Row(3, "c"), Row(4, "d")))
+    }
+  }
+
+  test("SPARK-49183: custom spark_catalog generates location for managed tables") {
+    // Reset CatalogManager to clear the materialized `spark_catalog` instance, so that we can
+    // configure a new implementation.
+    spark.sessionState.catalogManager.reset()
+    withSQLConf(V2_SESSION_CATALOG_IMPLEMENTATION.key -> classOf[SimpleDelegatingCatalog].getName) {
+      withTable("t") {
+        sql(s"CREATE TABLE t (i INT) USING $v2Format")
+        val table = catalog(SESSION_CATALOG_NAME).asTableCatalog
+          .loadTable(Identifier.of(Array("default"), "t"))
+        assert(!table.properties().containsKey(TableCatalog.PROP_EXTERNAL))
+      }
+    }
+  }
+
+  test("SPARK-49211: V2 Catalog can support built-in data sources") {
+    def checkParquet(tableName: String, path: String): Unit = {
+      withTable(tableName) {
+        sql("CREATE TABLE " + tableName +
+          " (name STRING) USING PARQUET LOCATION '" + path + "'")
+        sql("INSERT INTO " + tableName + " VALUES('Bob')")
+        val df = sql("SELECT * FROM " + tableName)
+        assert(df.queryExecution.analyzed.exists {
+          case LogicalRelation(_: HadoopFsRelation, _, _, _) => true
+          case _ => false
+        })
+        checkAnswer(df, Row("Bob"))
+      }
+    }
+
+    // Reset CatalogManager to clear the materialized `spark_catalog` instance, so that we can
+    // configure a new implementation.
+    val table1 = FullQualifiedTableName(SESSION_CATALOG_NAME, "default", "t")
+    spark.sessionState.catalogManager.reset()
+    withSQLConf(
+      V2_SESSION_CATALOG_IMPLEMENTATION.key ->
+        classOf[V2CatalogSupportBuiltinDataSource].getName) {
+      withTempPath { path =>
+        checkParquet(table1.toString, path.getAbsolutePath)
+      }
+    }
+    val table2 = FullQualifiedTableName("testcat3", "default", "t")
+    withSQLConf(
+      "spark.sql.catalog.testcat3" -> classOf[V2CatalogSupportBuiltinDataSource].getName) {
+      withTempPath { path =>
+        checkParquet(table2.toString, path.getAbsolutePath)
+      }
+    }
+  }
+
+  test("SPARK-49211: V2 Catalog support CTAS") {
+    def checkCTAS(tableName: String, path: String): Unit = {
+      sql("CREATE TABLE " + tableName + " USING PARQUET LOCATION '" + path +
+        "' AS SELECT 1, 2, 3")
+      checkAnswer(sql("SELECT * FROM " + tableName), Row(1, 2, 3))
+    }
+
+    // Reset CatalogManager to clear the materialized `spark_catalog` instance, so that we can
+    // configure a new implementation.
+    spark.sessionState.catalogManager.reset()
+    val table1 = FullQualifiedTableName(SESSION_CATALOG_NAME, "default", "t")
+    withSQLConf(
+      V2_SESSION_CATALOG_IMPLEMENTATION.key ->
+        classOf[V2CatalogSupportBuiltinDataSource].getName) {
+      withTempPath { path =>
+        checkCTAS(table1.toString, path.getAbsolutePath)
+      }
+    }
+
+    val table2 = FullQualifiedTableName("testcat3", "default", "t")
+    withSQLConf(
+      "spark.sql.catalog.testcat3" -> classOf[V2CatalogSupportBuiltinDataSource].getName) {
+      withTempPath { path =>
+        checkCTAS(table2.toString, path.getAbsolutePath)
+      }
+    }
+  }
+
   private def testNotSupportedV2Command(
       sqlCommand: String,
       sqlParams: String,
@@ -3427,3 +3724,50 @@ class DataSourceV2SQLSuiteV2Filter extends DataSourceV2SQLSuite {
 class ReserveSchemaNullabilityCatalog extends InMemoryCatalog {
   override def useNullableQuerySchema(): Boolean = false
 }
+
+class SimpleDelegatingCatalog extends DelegatingCatalogExtension {
+  override def createTable(
+      ident: Identifier,
+      columns: Array[ColumnV2],
+      partitions: Array[Transform],
+      properties: util.Map[String, String]): Table = {
+    val newProps = new util.HashMap[String, String]
+    newProps.putAll(properties)
+    newProps.put(TableCatalog.PROP_LOCATION, "/tmp/test_path")
+    newProps.put(TableCatalog.PROP_IS_MANAGED_LOCATION, "true")
+    super.createTable(ident, columns, partitions, newProps)
+  }
+}
+
+
+class V2CatalogSupportBuiltinDataSource extends InMemoryCatalog {
+  override def createTable(
+      ident: Identifier,
+      columns: Array[ColumnV2],
+      partitions: Array[Transform],
+      properties: util.Map[String, String]): Table = {
+    super.createTable(ident, columns, partitions, properties)
+    null
+  }
+
+  override def loadTable(ident: Identifier): Table = {
+    val superTable = super.loadTable(ident)
+    val tableIdent = {
+      TableIdentifier(ident.name(), Some(ident.namespace().head), Some(name))
+    }
+    val uri = CatalogUtils.stringToURI(superTable.properties().get(TableCatalog.PROP_LOCATION))
+    val sparkTable = CatalogTable(
+      tableIdent,
+      tableType = CatalogTableType.EXTERNAL,
+      storage = CatalogStorageFormat.empty.copy(
+        locationUri = Some(uri),
+        properties = superTable.properties().asScala.toMap
+      ),
+      schema = superTable.schema(),
+      provider = Some(superTable.properties().get(TableCatalog.PROP_PROVIDER)),
+      tracksPartitionsInCatalog = false
+    )
+    V1Table(sparkTable)
+  }
+}
+

@@ -23,7 +23,7 @@ import org.apache.spark.sql.catalyst.{FunctionIdentifier, InternalRow, TableIden
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, ExprCode}
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
-import org.apache.spark.sql.catalyst.plans.logical.{LeafNode, LogicalPlan, UnaryNode}
+import org.apache.spark.sql.catalyst.plans.logical.{CTERelationDef, LeafNode, LogicalPlan, UnaryNode}
 import org.apache.spark.sql.catalyst.trees.TreePattern._
 import org.apache.spark.sql.catalyst.util._
 import org.apache.spark.sql.catalyst.util.TypeUtils.toSQLId
@@ -60,33 +60,66 @@ trait UnresolvedUnaryNode extends UnaryNode with UnresolvedNode
  */
 case class PlanWithUnresolvedIdentifier(
     identifierExpr: Expression,
-    planBuilder: Seq[String] => LogicalPlan)
-  extends UnresolvedLeafNode {
+    children: Seq[LogicalPlan],
+    planBuilder: (Seq[String], Seq[LogicalPlan]) => LogicalPlan)
+  extends UnresolvedNode {
+
+  def this(identifierExpr: Expression, planBuilder: Seq[String] => LogicalPlan) = {
+    this(identifierExpr, Nil, (ident, _) => planBuilder(ident))
+  }
+
   final override val nodePatterns: Seq[TreePattern] = Seq(UNRESOLVED_IDENTIFIER)
+
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[LogicalPlan]): LogicalPlan =
+    copy(identifierExpr, newChildren, planBuilder)
+}
+
+/**
+ * A logical plan placeholder which delays CTE resolution
+ * to moment when PlanWithUnresolvedIdentifier gets resolved
+ */
+case class UnresolvedWithCTERelations(
+   unresolvedPlan: LogicalPlan,
+   cteRelations: Seq[(String, CTERelationDef)])
+  extends UnresolvedLeafNode {
+  final override val nodePatterns: Seq[TreePattern] = Seq(UNRESOLVED_IDENTIFIER_WITH_CTE)
 }
 
 /**
  * An expression placeholder that holds the identifier clause string expression. It will be
  * replaced by the actual expression with the evaluated identifier string.
+ *
+ * Note, the `exprBuilder` is a lambda and may hide other expressions from the expression tree. To
+ * avoid it, this placeholder has a field to hold other expressions, so that they can be properly
+ * transformed by catalyst rules.
  */
 case class ExpressionWithUnresolvedIdentifier(
     identifierExpr: Expression,
-    exprBuilder: Seq[String] => Expression)
-  extends UnaryExpression with Unevaluable {
+    otherExprs: Seq[Expression],
+    exprBuilder: (Seq[String], Seq[Expression]) => Expression)
+  extends Expression with Unevaluable {
+
+  def this(identifierExpr: Expression, exprBuilder: Seq[String] => Expression) = {
+    this(identifierExpr, Nil, (ident, _) => exprBuilder(ident))
+  }
+
   override lazy val resolved = false
-  override def child: Expression = identifierExpr
+  override def children: Seq[Expression] = identifierExpr +: otherExprs
   override def dataType: DataType = throw new UnresolvedException("dataType")
   override def nullable: Boolean = throw new UnresolvedException("nullable")
   final override val nodePatterns: Seq[TreePattern] = Seq(UNRESOLVED_IDENTIFIER)
-  override protected def withNewChildInternal(newChild: Expression): Expression = {
-    copy(identifierExpr = newChild)
+
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[Expression]): Expression = {
+    copy(identifierExpr = newChildren.head, otherExprs = newChildren.drop(1))
   }
 }
 
 /**
  * Holds the name of a relation that has yet to be looked up in a catalog.
  *
- * @param multipartIdentifier table name
+ * @param multipartIdentifier table name, the location of files or Kafka topic name, etc.
  * @param options options to scan this relation.
  */
 case class UnresolvedRelation(
@@ -319,7 +352,8 @@ case class UnresolvedFunction(
     isDistinct: Boolean,
     filter: Option[Expression] = None,
     ignoreNulls: Boolean = false,
-    orderingWithinGroup: Seq[SortOrder] = Seq.empty)
+    orderingWithinGroup: Seq[SortOrder] = Seq.empty,
+    isInternal: Boolean = false)
   extends Expression with Unevaluable {
   import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
 

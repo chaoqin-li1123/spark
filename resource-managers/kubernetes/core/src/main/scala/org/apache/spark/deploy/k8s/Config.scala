@@ -63,6 +63,15 @@ private[spark] object Config extends Logging {
       .booleanConf
       .createWithDefault(true)
 
+  val KUBERNETES_USE_LEGACY_PVC_ACCESS_MODE =
+    ConfigBuilder("spark.kubernetes.legacy.useReadWriteOnceAccessMode")
+      .internal()
+      .doc("If true, use ReadWriteOnce instead of ReadWriteOncePod as persistence volume " +
+        "access mode.")
+      .version("3.4.3")
+      .booleanConf
+      .createWithDefault(false)
+
   val KUBERNETES_DRIVER_SERVICE_IP_FAMILY_POLICY =
     ConfigBuilder("spark.kubernetes.driver.service.ipFamilyPolicy")
       .doc("K8s IP Family Policy for Driver Service")
@@ -702,7 +711,7 @@ private[spark] object Config extends Logging {
         "executor status.")
       .version("3.1.0")
       .booleanConf
-      .createWithDefault(false)
+      .createWithDefault(true)
 
   val KUBERNETES_EXECUTOR_MISSING_POD_DETECT_DELTA =
     ConfigBuilder("spark.kubernetes.executor.missingPodDetectDelta")

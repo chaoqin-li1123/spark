@@ -36,6 +36,7 @@ import org.apache.spark.sql.execution.streaming.AvailableNowTrigger
 import org.apache.spark.sql.execution.streaming.ContinuousTrigger
 import org.apache.spark.sql.execution.streaming.OneTimeTrigger
 import org.apache.spark.sql.execution.streaming.ProcessingTimeTrigger
+import org.apache.spark.sql.streaming.StreamingQueryListener.QueryStartedEvent
 import org.apache.spark.sql.types.NullType
 import org.apache.spark.util.SparkSerDeUtils
 
@@ -155,6 +156,23 @@ final class DataStreamWriter[T] private[sql] (ds: Dataset[T]) extends Logging {
   def partitionBy(colNames: String*): DataStreamWriter[T] = {
     sinkBuilder.clearPartitioningColumnNames()
     sinkBuilder.addAllPartitioningColumnNames(colNames.asJava)
+    this
+  }
+
+  /**
+   * Clusters the output by the given columns. If specified, the output is laid out such that
+   * records with similar values on the clustering column are grouped together in the same file.
+   *
+   * Clustering improves query efficiency by allowing queries with predicates on the clustering
+   * columns to skip unnecessary data. Unlike partitioning, clustering can be used on very high
+   * cardinality columns.
+   *
+   * @since 4.0.0
+   */
+  @scala.annotation.varargs
+  def clusterBy(colNames: String*): DataStreamWriter[T] = {
+    sinkBuilder.clearClusteringColumnNames()
+    sinkBuilder.addAllClusteringColumnNames(colNames.asJava)
     this
   }
 
@@ -297,6 +315,11 @@ final class DataStreamWriter[T] private[sql] (ds: Dataset[T]) extends Logging {
       .build()
 
     val resp = ds.sparkSession.execute(startCmd).head
+    if (resp.getWriteStreamOperationStartResult.hasQueryStartedEventJson) {
+      val event = QueryStartedEvent.fromJson(
+        resp.getWriteStreamOperationStartResult.getQueryStartedEventJson)
+      ds.sparkSession.streams.streamingQueryListenerBus.postToAll(event)
+    }
     RemoteStreamingQuery.fromStartCommandResponse(ds.sparkSession, resp)
   }
 

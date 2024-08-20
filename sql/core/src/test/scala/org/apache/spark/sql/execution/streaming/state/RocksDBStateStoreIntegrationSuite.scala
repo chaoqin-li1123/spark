@@ -107,7 +107,8 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest
               "rocksdbTotalBytesReadByCompaction", "rocksdbTotalBytesWrittenByCompaction",
               "rocksdbTotalCompactionLatencyMs", "rocksdbWriterStallLatencyMs",
               "rocksdbTotalBytesReadThroughIterator", "rocksdbTotalBytesWrittenByFlush",
-              "rocksdbPinnedBlocksMemoryUsage"))
+              "rocksdbPinnedBlocksMemoryUsage", "rocksdbNumExternalColumnFamilies",
+              "rocksdbNumInternalColumnFamilies"))
           }
         } finally {
           query.stop()
@@ -163,6 +164,8 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest
     TestWithBothChangelogCheckpointingEnabledAndDisabled) { colFamiliesEnabled =>
     withSQLConf(
       SQLConf.STATE_STORE_PROVIDER_CLASS.key -> classOf[RocksDBStateStoreProvider].getName,
+      // Set an unsupported RocksDB format version and the query should fail if it's passed down
+      // into RocksDB
       SQLConf.STATE_STORE_ROCKSDB_FORMAT_VERSION.key -> "100") {
       val inputData = MemoryStream[Int]
       val query = inputData.toDS().toDF("value")
@@ -174,9 +177,8 @@ class RocksDBStateStoreIntegrationSuite extends StreamTest
         .outputMode("complete")
         .start()
       inputData.addData(1, 2)
-      query.processAllAvailable()
-      assert(getFormatVersion(query) == 100)
-      query.stop()
+      val e = intercept[StreamingQueryException](query.processAllAvailable())
+      assert(e.getCause.getCause.getMessage.contains("Unsupported BlockBasedTable format_version"))
     }
   }
 

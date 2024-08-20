@@ -29,10 +29,12 @@ import org.json4s.{JArray, JBool, JDecimal, JDouble, JField, JLong, JNull, JObje
 import org.json4s.JsonAST.JValue
 import org.json4s.jackson.JsonMethods.{compact, pretty, render}
 
+import org.apache.spark.SparkIllegalArgumentException
 import org.apache.spark.annotation.{Stable, Unstable}
 import org.apache.spark.sql.catalyst.expressions.GenericRow
 import org.apache.spark.sql.catalyst.util.{DateFormatter, SparkDateTimeUtils, TimestampFormatter, UDTUtils}
 import org.apache.spark.sql.errors.DataTypeErrors
+import org.apache.spark.sql.errors.DataTypeErrors.{toSQLType, toSQLValue}
 import org.apache.spark.sql.internal.SqlApiConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.CalendarInterval
@@ -217,7 +219,7 @@ trait Row extends Serializable {
    * Returns the value at position i as a primitive boolean.
    *
    * @throws ClassCastException when data type does not match.
-   * @throws NullPointerException when value is null.
+   * @throws org.apache.spark.SparkRuntimeException when value is null.
    */
   def getBoolean(i: Int): Boolean = getAnyValAs[Boolean](i)
 
@@ -225,7 +227,7 @@ trait Row extends Serializable {
    * Returns the value at position i as a primitive byte.
    *
    * @throws ClassCastException when data type does not match.
-   * @throws NullPointerException when value is null.
+   * @throws org.apache.spark.SparkRuntimeException when value is null.
    */
   def getByte(i: Int): Byte = getAnyValAs[Byte](i)
 
@@ -233,7 +235,7 @@ trait Row extends Serializable {
    * Returns the value at position i as a primitive short.
    *
    * @throws ClassCastException when data type does not match.
-   * @throws NullPointerException when value is null.
+   * @throws org.apache.spark.SparkRuntimeException when value is null.
    */
   def getShort(i: Int): Short = getAnyValAs[Short](i)
 
@@ -241,7 +243,7 @@ trait Row extends Serializable {
    * Returns the value at position i as a primitive int.
    *
    * @throws ClassCastException when data type does not match.
-   * @throws NullPointerException when value is null.
+   * @throws org.apache.spark.SparkRuntimeException when value is null.
    */
   def getInt(i: Int): Int = getAnyValAs[Int](i)
 
@@ -249,7 +251,7 @@ trait Row extends Serializable {
    * Returns the value at position i as a primitive long.
    *
    * @throws ClassCastException when data type does not match.
-   * @throws NullPointerException when value is null.
+   * @throws org.apache.spark.SparkRuntimeException when value is null.
    */
   def getLong(i: Int): Long = getAnyValAs[Long](i)
 
@@ -258,7 +260,7 @@ trait Row extends Serializable {
    * Throws an exception if the type mismatches or if the value is null.
    *
    * @throws ClassCastException when data type does not match.
-   * @throws NullPointerException when value is null.
+   * @throws org.apache.spark.SparkRuntimeException when value is null.
    */
   def getFloat(i: Int): Float = getAnyValAs[Float](i)
 
@@ -266,7 +268,7 @@ trait Row extends Serializable {
    * Returns the value at position i as a primitive double.
    *
    * @throws ClassCastException when data type does not match.
-   * @throws NullPointerException when value is null.
+   * @throws org.apache.spark.SparkRuntimeException when value is null.
    */
   def getDouble(i: Int): Double = getAnyValAs[Double](i)
 
@@ -318,8 +320,15 @@ trait Row extends Serializable {
    * @throws ClassCastException when data type does not match.
    */
   def getSeq[T](i: Int): Seq[T] = {
-    val res = getAs[scala.collection.Seq[T]](i)
-    if (res != null) res.toSeq else null
+    getAs[scala.collection.Seq[T]](i) match {
+      // SPARK-49178: When the type of `Seq[T]` is `mutable.ArraySeq[T]`,
+      // rewrap `mutable.ArraySeq[T].array` as `immutable.ArraySeq[T]`
+      // to avoid a collection copy.
+      case seq: mutable.ArraySeq[T] =>
+        seq.array.toImmutableArraySeq.asInstanceOf[Seq[T]]
+      case other if other != null => other.toSeq
+      case _ => null
+    }
   }
 
   /**
@@ -379,7 +388,7 @@ trait Row extends Serializable {
    * @throws IllegalArgumentException when a field `name` does not exist.
    */
   def fieldIndex(name: String): Int = {
-    throw DataTypeErrors.fieldIndexOnRowWithoutSchemaError()
+    throw DataTypeErrors.fieldIndexOnRowWithoutSchemaError(fieldName = name)
   }
 
   /**
@@ -521,7 +530,7 @@ trait Row extends Serializable {
    *
    * @throws UnsupportedOperationException when schema is not defined.
    * @throws ClassCastException when data type does not match.
-   * @throws NullPointerException when value is null.
+   * @throws org.apache.spark.SparkRuntimeException when value is null.
    */
   private def getAnyValAs[T <: AnyVal](i: Int): T =
     if (isNullAt(i)) throw DataTypeErrors.valueIsNullError(i)
@@ -609,9 +618,13 @@ trait Row extends Serializable {
         new JObject(elements.toList)
       case (v: Any, udt: UserDefinedType[Any @unchecked]) =>
         toJson(UDTUtils.toRow(v, udt), udt.sqlType)
-      case _ =>
-        throw new IllegalArgumentException(s"Failed to convert value $value " +
-          s"(class of ${value.getClass}}) with the type of $dataType to JSON.")
+      case _ => throw new SparkIllegalArgumentException(
+        errorClass = "FAILED_ROW_TO_JSON",
+        messageParameters = Map(
+          "value" -> toSQLValue(value.toString),
+          "class" -> value.getClass.toString,
+          "sqlType" -> toSQLType(dataType.toString))
+      )
     }
     toJson(this, schema)
   }

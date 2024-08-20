@@ -18,7 +18,11 @@ import inspect
 import os
 import unittest
 
-from pyspark.sql.tests.test_udf_profiler import UDFProfiler2TestsMixin, _do_computation
+from pyspark.sql.tests.test_udf_profiler import (
+    UDFProfiler2TestsMixin,
+    _do_computation,
+    has_flameprof,
+)
 from pyspark.testing.connectutils import ReusedConnectTestCase
 
 
@@ -26,6 +30,20 @@ class UDFProfilerParityTests(UDFProfiler2TestsMixin, ReusedConnectTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.spark._profiler_collector._value = None
+
+
+class UDFProfilerWithoutPlanCacheParityTests(UDFProfilerParityTests):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.spark.conf.set("spark.connect.session.planCache.enabled", False)
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            cls.spark.conf.unset("spark.connect.session.planCache.enabled")
+        finally:
+            super().tearDownClass()
 
     def test_perf_profiler_udf_multiple_actions(self):
         def action(df):
@@ -35,16 +53,20 @@ class UDFProfilerParityTests(UDFProfiler2TestsMixin, ReusedConnectTestCase):
         with self.sql_conf({"spark.sql.pyspark.udf.profiler": "perf"}):
             _do_computation(self.spark, action=action)
 
+        # Without the plan cache, UDF ID will be different for each action
         self.assertEqual(6, len(self.profile_results), str(list(self.profile_results)))
 
         for id in self.profile_results:
             with self.trap_stdout() as io:
-                self.spark.showPerfProfiles(id)
+                self.spark.profile.show(id, type="perf")
 
             self.assertIn(f"Profile of UDF<id={id}>", io.getvalue())
             self.assertRegex(
                 io.getvalue(), f"10.*{os.path.basename(inspect.getfile(_do_computation))}"
             )
+
+            if has_flameprof:
+                self.assertIn("svg", self.spark.profile.render(id))
 
 
 if __name__ == "__main__":

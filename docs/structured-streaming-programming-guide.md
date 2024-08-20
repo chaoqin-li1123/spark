@@ -561,6 +561,8 @@ Here are the details of all the sources in Spark.
         <br/>
         <code>maxFilesPerTrigger</code>: maximum number of new files to be considered in every trigger (default: no max)
         <br/>
+        <code>maxBytesPerTrigger</code>: maximum total size of new files to be considered in every trigger (default: no max). <code>maxBytesPerTrigger</code> and <code>maxFilesPerTrigger</code> can't both be set at the same time, only one of two must be chosen. Note that a stream always reads at least one file so it can make progress and not get stuck on a file larger than a given maximum.
+        <br/>
         <code>latestFirst</code>: whether to process the latest new files first, useful when there is a large backlog of files (default: false)
         <br/>
         <code>fileNameOnly</code>: whether to check new files based on only the filename instead of on the full path (default: false). With this set to `true`, the following files would be considered as the same file, because their filenames, "dataset.txt", are the same:
@@ -570,7 +572,11 @@ Here are the details of all the sources in Spark.
         "s3n://a/b/dataset.txt"<br/>
         "s3a://a/b/c/dataset.txt"
         <br/>
-        <code>maxFileAge</code>: Maximum age of a file that can be found in this directory, before it is ignored. For the first batch all files will be considered valid. If <code>latestFirst</code> is set to `true` and <code>maxFilesPerTrigger</code> is set, then this parameter will be ignored, because old files that are valid, and should be processed, may be ignored. The max age is specified with respect to the timestamp of the latest file, and not the timestamp of the current system.(default: 1 week)
+        <code>maxFileAge</code>: Maximum age of a file that can be found in this directory, before it is ignored. For the first batch all files will be considered valid. If <code>latestFirst</code> is set to `true` and <code>maxFilesPerTrigger</code> or <code>maxBytesPerTrigger</code> is set, then this parameter will be ignored, because old files that are valid, and should be processed, may be ignored. The max age is specified with respect to the timestamp of the latest file, and not the timestamp of the current system.(default: 1 week)
+        <br/>
+        <code>maxCachedFiles</code>: maximum number of files to cache to be processed in subsequent batches (default: 10000).  If files are available in the cache, they will be read from first before listing from the input source.
+        <br/>
+        <code>discardCachedInputRatio</code>: ratio of cached files/bytes to max files/bytes to allow for listing from input source when there is less cached input than could be available to be read (default: 0.2).  For example, if there are only 10 cached files remaining for a batch but the <code>maxFilesPerTrigger</code> is set to 100, the 10 cached files would be discarded and a new listing would be performed instead. Similarly, if there are cached files that are 10 MB remaining for a batch, but the <code>maxBytesPerTrigger</code> is set to 100MB, the cached files would be discarded.
         <br/>
         <code>cleanSource</code>: option to clean up completed files after processing.<br/>
         Available options are "archive", "delete", "off". If the option is not provided, the default value is "off".<br/>
@@ -2138,7 +2144,7 @@ streamingDf <- dropDuplicates(streamingDf, "guid", "eventTime")
 
 Specifically for streaming, you can deduplicate records in data streams using a unique identifier in the events, within the time range of watermark.
 For example, if you set the delay threshold of watermark as "1 hour", duplicated events which occurred within 1 hour can be correctly deduplicated.
-(For more details, please refer to the API doc of [dropDuplicatesWithinWatermark](/api/scala/org/apache/spark/sql/Dataset.html#dropDuplicatesWithinWatermark():org.apache.spark.sql.Dataset[T]).)
+(For more details, please refer to the API doc of [dropDuplicatesWithinWatermark](api/scala/org/apache/spark/sql/Dataset.html#dropDuplicatesWithinWatermark():org.apache.spark.sql.Dataset[T]).)
 
 This can be used to deal with use case where event time column cannot be a part of unique identifier, mostly due to the case
 where event times are somehow different for the same records. (E.g. non-idempotent writer where issuing event time happens at write)
@@ -2967,7 +2973,11 @@ streamingDF.writeStream.foreachBatch { (batchDF: DataFrame, batchId: Long) =>
   batchId provided to the function as way to deduplicate the output and get an exactly-once guarantee.
 - `foreachBatch` does not work with the continuous processing mode as it fundamentally relies on the
   micro-batch execution of a streaming query. If you write data in the continuous mode, use `foreach` instead.
-
+- If `foreachBatch` is used with stateful streaming queries and multiple DataFrame actions are performed
+  on the same DataFrame (such as `df.count()` followed by `df.collect()`), the query will be evaluated multiple times leading to
+  the state being reloaded multiple times within the same batch resulting in degraded performance. In this case,
+  it's highly recommended for users to call `persist` and `unpersist` on the DataFrame,
+  within the `foreachBatch` UDF (user-defined function) to avoid recomputation.
 
 ###### Foreach
 If `foreachBatch` is not an option (for example, corresponding batch data writer does not exist, or
@@ -3272,8 +3282,8 @@ Here are the different kinds of triggers that are supported.
     <td>
         Similar to queries one-time micro-batch trigger, the query will process all the available data and then
         stop on its own. The difference is that, it will process the data in (possibly) multiple micro-batches
-        based on the source options (e.g. <code>maxFilesPerTrigger</code> for file source), which will result
-        in better query scalability.
+        based on the source options (e.g. <code>maxFilesPerTrigger</code> or <code>maxBytesPerTrigger</code> for file 
+        source), which will result in better query scalability.
         <ul>
             <li>This trigger provides a strong guarantee of processing: regardless of how many batches were
                 left over in previous run, it ensures all available data at the time of execution gets

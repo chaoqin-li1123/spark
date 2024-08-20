@@ -26,7 +26,7 @@ import scala.collection.mutable
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{LocalFileSystem, Path}
 
-import org.apache.spark.{SparkException, SparkFileNotFoundException, SparkRuntimeException, SparkUnsupportedOperationException}
+import org.apache.spark.{SparkException, SparkRuntimeException, SparkUnsupportedOperationException}
 import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskEnd}
 import org.apache.spark.sql.TestingUDT.{IntervalUDT, NullData, NullUDT}
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, GreaterThan, Literal}
@@ -246,16 +246,12 @@ class FileBasedDataSourceSuite extends QueryTest
           if (ignore.toBoolean) {
             testIgnoreMissingFiles(options)
           } else {
-            val errorClass = sources match {
-              case "" => "_LEGACY_ERROR_TEMP_2062"
-              case _ => "_LEGACY_ERROR_TEMP_2055"
-            }
             checkErrorMatchPVals(
               exception = intercept[SparkException] {
                 testIgnoreMissingFiles(options)
-              }.getCause.asInstanceOf[SparkFileNotFoundException],
-              errorClass = errorClass,
-              parameters = Map("message" -> ".*does not exist")
+              },
+              errorClass = "FAILED_READ_FILE.FILE_NOT_EXIST",
+              parameters = Map("path" -> ".*")
             )
           }
         }
@@ -478,7 +474,7 @@ class FileBasedDataSourceSuite extends QueryTest
         errorClass = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
         parameters = Map(
           "columnName" -> "`vectors`",
-          "columnType" -> "\"ARRAY<DOUBLE>\"",
+          "columnType" -> "UDT(\"ARRAY<DOUBLE>\")",
           "format" -> "CSV")
       )
 
@@ -491,7 +487,7 @@ class FileBasedDataSourceSuite extends QueryTest
         errorClass = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
         parameters = Map(
           "columnName" -> "`a`",
-          "columnType" -> "\"ARRAY<DOUBLE>\"",
+          "columnType" -> "UDT(\"ARRAY<DOUBLE>\")",
           "format" -> "CSV")
       )
     }
@@ -549,7 +545,7 @@ class FileBasedDataSourceSuite extends QueryTest
               errorClass = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
               parameters = Map(
                 "columnName" -> "`a`",
-                "columnType" -> "\"INTERVAL\"",
+                "columnType" -> "UDT(\"INTERVAL\")",
                 "format" -> formatParameter
               )
             )
@@ -599,7 +595,7 @@ class FileBasedDataSourceSuite extends QueryTest
               errorClass = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
               parameters = Map(
                 "columnName" -> "`testType()`",
-                "columnType" -> "\"VOID\"",
+                "columnType" -> "UDT(\"VOID\")",
                 "format" -> formatParameter
               )
             )
@@ -628,7 +624,7 @@ class FileBasedDataSourceSuite extends QueryTest
               errorClass = "UNSUPPORTED_DATA_TYPE_FOR_DATASOURCE",
               parameters = Map(
                 "columnName" -> "`a`",
-                "columnType" -> "\"VOID\"",
+                "columnType" -> "UDT(\"VOID\")",
                 "format" -> formatParameter
               )
             )

@@ -17,21 +17,22 @@
 
 package org.apache.spark.deploy.master.ui
 
-import javax.servlet.http.HttpServletRequest
-
 import scala.xml.Node
 
+import jakarta.servlet.http.HttpServletRequest
 import org.json4s.JValue
 
 import org.apache.spark.deploy.DeployMessages.{KillDriverResponse, MasterStateResponse, RequestKillDriver, RequestMasterState}
 import org.apache.spark.deploy.JsonProtocol
 import org.apache.spark.deploy.StandaloneResourceUtils._
 import org.apache.spark.deploy.master._
+import org.apache.spark.internal.config.UI.MASTER_UI_TITLE
 import org.apache.spark.ui.{UIUtils, WebUIPage}
 import org.apache.spark.util.Utils
 
 private[ui] class MasterPage(parent: MasterWebUI) extends WebUIPage("") {
   private val master = parent.masterEndpointRef
+  private val title = parent.master.conf.get(MASTER_UI_TITLE)
   private val jsonFieldPattern = "/json/([a-zA-Z]+).*".r
 
   def getMasterState: MasterStateResponse = {
@@ -170,8 +171,9 @@ private[ui] class MasterPage(parent: MasterWebUI) extends WebUIPage("") {
                 {state.completedDrivers.count(_.state == DriverState.ERROR)} Error,
                 {state.completedDrivers.count(_.state == DriverState.RELAUNCHING)} Relaunching)
               </li>
-              <li><strong>Status:</strong>
-                <a href={"/logPage/?self&logType=out"}>{state.status}</a>
+              <li><strong>Status:</strong> {state.status}
+                (<a href={"/environment/"}>Environment</a>,
+                <a href={"/logPage/?self&logType=out"}>Log</a>)
               </li>
             </ul>
           </div>
@@ -266,7 +268,7 @@ private[ui] class MasterPage(parent: MasterWebUI) extends WebUIPage("") {
           }
         </div>;
 
-    UIUtils.basicSparkPage(request, content, "Spark Master at " + state.uri)
+    UIUtils.basicSparkPage(request, content, title.getOrElse("Spark Master at " + state.uri))
   }
 
   private def workerRow(showResourceColumn: Boolean): WorkerInfo => Seq[Node] = worker => {

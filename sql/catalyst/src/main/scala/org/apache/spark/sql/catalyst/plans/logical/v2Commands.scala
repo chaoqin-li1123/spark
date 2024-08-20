@@ -17,9 +17,9 @@
 
 package org.apache.spark.sql.catalyst.plans.logical
 
-import org.apache.spark.SparkUnsupportedOperationException
+import org.apache.spark.{SparkIllegalArgumentException, SparkUnsupportedOperationException}
 import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.catalyst.analysis.{AnalysisContext, AssignmentUtils, EliminateSubqueryAliases, FieldName, NamedRelation, PartitionSpec, ResolvedIdentifier, UnresolvedException}
+import org.apache.spark.sql.catalyst.analysis.{AnalysisContext, AssignmentUtils, EliminateSubqueryAliases, FieldName, NamedRelation, PartitionSpec, ResolvedIdentifier, UnresolvedException, ViewSchemaMode}
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.catalyst.catalog.FunctionResource
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, AttributeSet, Expression, MetadataAttribute, NamedExpression, UnaryExpression, Unevaluable, V2ExpressionUtils}
@@ -64,10 +64,11 @@ trait V2WriteCommand extends UnaryCommand with KeepAnalyzedQuery with CTEInChild
     table.skipSchemaResolution || (query.output.size == table.output.size &&
       query.output.zip(table.output).forall {
         case (inAttr, outAttr) =>
+          val inType = CharVarcharUtils.getRawType(inAttr.metadata).getOrElse(inAttr.dataType)
           val outType = CharVarcharUtils.getRawType(outAttr.metadata).getOrElse(outAttr.dataType)
           // names and types must match, nullability must be compatible
           inAttr.name == outAttr.name &&
-            DataType.equalsIgnoreCompatibleNullability(inAttr.dataType, outType) &&
+            DataType.equalsIgnoreCompatibleNullability(inType, outType) &&
             (outAttr.nullable || !inAttr.nullable)
       })
   }
@@ -442,7 +443,9 @@ trait V2CreateTableAsSelectPlan
       case Seq(newName, newQuery) =>
         withNameAndQuery(newName, newQuery)
       case others =>
-        throw new IllegalArgumentException("Must be 2 children: " + others)
+        throw new SparkIllegalArgumentException(
+          errorClass = "_LEGACY_ERROR_TEMP_3218",
+          messageParameters = Map("others" -> others.toString()))
     }
   }
 
@@ -752,7 +755,8 @@ case class MergeIntoTable(
     mergeCondition: Expression,
     matchedActions: Seq[MergeAction],
     notMatchedActions: Seq[MergeAction],
-    notMatchedBySourceActions: Seq[MergeAction]) extends BinaryCommand with SupportsSubquery {
+    notMatchedBySourceActions: Seq[MergeAction],
+    withSchemaEvolution: Boolean) extends BinaryCommand with SupportsSubquery {
 
   lazy val aligned: Boolean = {
     val actions = matchedActions ++ notMatchedActions ++ notMatchedBySourceActions
@@ -1291,6 +1295,17 @@ case class AlterViewAs(
 }
 
 /**
+ * The logical plan of the ALTER VIEW ... WITH SCHEMA command.
+ */
+case class AlterViewSchemaBinding(
+    child: LogicalPlan,
+    viewSchemaMode: ViewSchemaMode)
+  extends UnaryCommand {
+  override protected def withNewChildInternal(newChild: LogicalPlan): LogicalPlan =
+    copy(child = newChild)
+}
+
+/**
  * The logical plan of the CREATE VIEW ... command.
  */
 case class CreateView(
@@ -1301,7 +1316,8 @@ case class CreateView(
     originalText: Option[String],
     query: LogicalPlan,
     allowExisting: Boolean,
-    replace: Boolean) extends BinaryCommand with CTEInChildren {
+    replace: Boolean,
+    viewSchemaMode: ViewSchemaMode) extends BinaryCommand with CTEInChildren {
   override def left: LogicalPlan = child
   override def right: LogicalPlan = query
   override protected def withNewChildrenInternal(

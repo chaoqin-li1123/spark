@@ -709,7 +709,8 @@ class AnalysisSuite extends AnalysisTest with Matchers {
       pythonUdf,
       output,
       project,
-      false)
+      false,
+      None)
     val left = SubqueryAlias("temp0", mapInPandas)
     val right = SubqueryAlias("temp1", mapInPandas)
     val join = Join(left, right, Inner, None, JoinHint.NONE)
@@ -729,7 +730,8 @@ class AnalysisSuite extends AnalysisTest with Matchers {
       pythonUdf,
       output,
       project,
-      false)
+      false,
+      None)
     assertAnalysisSuccess(mapInPandas)
   }
 
@@ -745,7 +747,8 @@ class AnalysisSuite extends AnalysisTest with Matchers {
       pythonUdf,
       output,
       project,
-      false)
+      false,
+      None)
     assertAnalysisSuccess(mapInArrow)
   }
 
@@ -756,9 +759,10 @@ class AnalysisSuite extends AnalysisTest with Matchers {
         testRelation,
         testRelation,
         cond,
-        UpdateAction(Some(cond), Assignment($"a", $"a") :: Nil) :: Nil,
-        Nil,
-        Nil
+        matchedActions = UpdateAction(Some(cond), Assignment($"a", $"a") :: Nil) :: Nil,
+        notMatchedActions = Nil,
+        notMatchedBySourceActions = Nil,
+        withSchemaEvolution = false
       ),
       "AMBIGUOUS_REFERENCE",
       Map("name" -> "`a`", "referenceNames" -> "[`a`, `a`]"))
@@ -1348,7 +1352,7 @@ class AnalysisSuite extends AnalysisTest with Matchers {
       expectedErrorClass = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
       expectedMessageParameters = Map(
         "sqlExpr" -> "\"mean(c)\"",
-        "paramIndex" -> "1",
+        "paramIndex" -> "first",
         "inputSql" -> "\"c\"",
         "inputType" -> "\"BOOLEAN\"",
         "requiredType" -> "\"NUMERIC\" or \"ANSI INTERVAL\""),
@@ -1367,7 +1371,7 @@ class AnalysisSuite extends AnalysisTest with Matchers {
       expectedErrorClass = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
       expectedMessageParameters = Map(
         "sqlExpr" -> "\"mean(c)\"",
-        "paramIndex" -> "1",
+        "paramIndex" -> "first",
         "inputSql" -> "\"c\"",
         "inputType" -> "\"BOOLEAN\"",
         "requiredType" -> "\"NUMERIC\" or \"ANSI INTERVAL\""),
@@ -1385,7 +1389,7 @@ class AnalysisSuite extends AnalysisTest with Matchers {
       expectedErrorClass = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
       expectedMessageParameters = Map(
         "sqlExpr" -> "\"abs(c)\"",
-        "paramIndex" -> "1",
+        "paramIndex" -> "first",
         "inputSql" -> "\"c\"",
         "inputType" -> "\"BOOLEAN\"",
         "requiredType" ->
@@ -1405,7 +1409,7 @@ class AnalysisSuite extends AnalysisTest with Matchers {
       expectedErrorClass = "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
       expectedMessageParameters = Map(
         "sqlExpr" -> "\"abs(c)\"",
-        "paramIndex" -> "1",
+        "paramIndex" -> "first",
         "inputSql" -> "\"c\"",
         "inputType" -> "\"BOOLEAN\"",
         "requiredType" ->
@@ -1742,15 +1746,15 @@ class AnalysisSuite extends AnalysisTest with Matchers {
     val name = Literal("a").as("name")
     val replaceable = new Nvl(Literal("a"), Literal("b"))
     withClue("IDENTIFIER as column") {
-      val ident = ExpressionWithUnresolvedIdentifier(name, UnresolvedAttribute.apply)
+      val ident = new ExpressionWithUnresolvedIdentifier(name, UnresolvedAttribute.apply)
       checkAnalysis(testRelation.select(ident), testRelation.select($"a").analyze)
-      val ident2 = ExpressionWithUnresolvedIdentifier(replaceable, UnresolvedAttribute.apply)
+      val ident2 = new ExpressionWithUnresolvedIdentifier(replaceable, UnresolvedAttribute.apply)
       checkAnalysis(testRelation.select(ident2), testRelation.select($"a").analyze)
     }
     withClue("IDENTIFIER as table") {
-      val ident = PlanWithUnresolvedIdentifier(name, _ => testRelation)
+      val ident = new PlanWithUnresolvedIdentifier(name, _ => testRelation)
       checkAnalysis(ident.select($"a"), testRelation.select($"a").analyze)
-      val ident2 = PlanWithUnresolvedIdentifier(replaceable, _ => testRelation)
+      val ident2 = new PlanWithUnresolvedIdentifier(replaceable, _ => testRelation)
       checkAnalysis(ident2.select($"a"), testRelation.select($"a").analyze)
     }
   }
@@ -1791,5 +1795,16 @@ class AnalysisSuite extends AnalysisTest with Matchers {
     assert(refs.length == 1)
     assert(refs.head.resolved)
     assert(refs.head.isStreaming)
+  }
+
+  test("SPARK-47927: ScalaUDF output nullability") {
+    val udf = ScalaUDF(
+      function = (i: Int) => i + 1,
+      dataType = IntegerType,
+      children = $"a" :: Nil,
+      nullable = false,
+      inputEncoders = Seq(Some(ExpressionEncoder[Int]().resolveAndBind())))
+    val plan = testRelation.select(udf.as("u")).select($"u").analyze
+    assert(plan.output.head.nullable)
   }
 }

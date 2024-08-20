@@ -58,10 +58,12 @@ class RelationalGroupedDataset protected[sql](
   import RelationalGroupedDataset._
 
   private[this] def toDF(aggExprs: Seq[Expression]): DataFrame = {
+    @scala.annotation.nowarn("cat=deprecation")
     val aggregates = if (df.sparkSession.sessionState.conf.dataFrameRetainGroupColumns) {
       groupingExprs match {
-        // call `toList` because `LazyList` can't serialize in scala 2.13
+        // call `toList` because `Stream` and `LazyList` can't serialize in scala 2.13
         case s: LazyList[Expression] => s.toList ++ aggExprs
+        case s: Stream[Expression] => s.toList ++ aggExprs
         case other => other ++ aggExprs
       }
     } else {
@@ -324,15 +326,12 @@ class RelationalGroupedDataset protected[sql](
   /**
    * Pivots a column of the current `DataFrame` and performs the specified aggregation.
    *
-   * There are two versions of `pivot` function: one that requires the caller to specify the list
-   * of distinct values to pivot on, and one that does not. The latter is more concise but less
-   * efficient, because Spark needs to first compute the list of distinct values internally.
+   * Spark will eagerly compute the distinct values in `pivotColumn` so it can determine
+   * the resulting schema of the transformation. To avoid any eager computations, provide an
+   * explicit list of values via `pivot(pivotColumn: String, values: Seq[Any])`.
    *
    * {{{
    *   // Compute the sum of earnings for each year by course with each course as a separate column
-   *   df.groupBy("year").pivot("course", Seq("dotNET", "Java")).sum("earnings")
-   *
-   *   // Or without specifying column values (less efficient)
    *   df.groupBy("year").pivot("course").sum("earnings")
    * }}}
    *
@@ -407,10 +406,13 @@ class RelationalGroupedDataset protected[sql](
 
   /**
    * Pivots a column of the current `DataFrame` and performs the specified aggregation.
-   * This is an overloaded version of the `pivot` method with `pivotColumn` of the `String` type.
+   *
+   * Spark will eagerly compute the distinct values in `pivotColumn` so it can determine
+   * the resulting schema of the transformation. To avoid any eager computations, provide an
+   * explicit list of values via `pivot(pivotColumn: Column, values: Seq[Any])`.
    *
    * {{{
-   *   // Or without specifying column values (less efficient)
+   *   // Compute the sum of earnings for each year by course with each course as a separate column
    *   df.groupBy($"year").pivot($"course").sum($"earnings");
    * }}}
    *
@@ -421,28 +423,7 @@ class RelationalGroupedDataset protected[sql](
    * @since 2.4.0
    */
   def pivot(pivotColumn: Column): RelationalGroupedDataset = {
-    if (df.isStreaming) {
-      throw new AnalysisException(
-        errorClass = "_LEGACY_ERROR_TEMP_3063",
-        messageParameters = Map.empty)
-    }
-    // This is to prevent unintended OOM errors when the number of distinct values is large
-    val maxValues = df.sparkSession.sessionState.conf.dataFramePivotMaxValues
-    // Get the distinct values of the column and sort them so its consistent
-    val values = df.select(pivotColumn)
-      .distinct()
-      .limit(maxValues + 1)
-      .sort(pivotColumn)  // ensure that the output columns are in a consistent logical order
-      .collect()
-      .map(_.get(0))
-      .toImmutableArraySeq
-
-    if (values.length > maxValues) {
-      throw QueryCompilationErrors.aggregationFunctionAppliedOnNonNumericColumnError(
-        pivotColumn.toString, maxValues)
-    }
-
-    pivot(pivotColumn, values)
+    pivot(pivotColumn, collectPivotValues(df, pivotColumn))
   }
 
   /**
@@ -744,6 +725,42 @@ class RelationalGroupedDataset protected[sql](
     Dataset.ofRows(df.sparkSession, plan)
   }
 
+  /**
+   * Applies a grouped vectorized python user-defined function to each group of data.
+   * The user-defined function defines a transformation: iterator of `pandas.DataFrame` ->
+   * iterator of `pandas.DataFrame`.
+   * For each group, all elements in the group are passed as an iterator of `pandas.DataFrame`
+   * along with corresponding state, and the results for all groups are combined into a new
+   * [[DataFrame]].
+   *
+   * This function uses Apache Arrow as serialization format between Java executors and Python
+   * workers.
+   */
+  private[sql] def transformWithStateInPandas(
+      func: PythonUDF,
+      outputStructType: StructType,
+      outputModeStr: String,
+      timeModeStr: String): DataFrame = {
+    val groupingNamedExpressions = groupingExprs.map {
+      case ne: NamedExpression => ne
+      case other => Alias(other, other.toString)()
+    }
+    val groupingAttrs = groupingNamedExpressions.map(_.toAttribute)
+    val outputAttrs = toAttributes(outputStructType)
+    val outputMode = InternalOutputModes(outputModeStr)
+    val timeMode = TimeModes(timeModeStr)
+
+    val plan = TransformWithStateInPandas(
+      func,
+      groupingAttrs,
+      outputAttrs,
+      outputMode,
+      timeMode,
+      child = df.logicalPlan
+    )
+    Dataset.ofRows(df.sparkSession, plan)
+  }
+
   override def toString: String = {
     val builder = new StringBuilder
     builder.append("RelationalGroupedDataset: [grouping expressions: [")
@@ -794,6 +811,30 @@ private[sql] object RelationalGroupedDataset {
     case a: AggregateExpression => UnresolvedAlias(a, Some(Column.generateAlias))
     case _ if !expr.resolved => UnresolvedAlias(expr, None)
     case expr: Expression => Alias(expr, toPrettySQL(expr))()
+  }
+
+  private[sql] def collectPivotValues(df: DataFrame, pivotColumn: Column): Seq[Any] = {
+    if (df.isStreaming) {
+      throw new AnalysisException(
+        errorClass = "_LEGACY_ERROR_TEMP_3063",
+        messageParameters = Map.empty)
+    }
+    // This is to prevent unintended OOM errors when the number of distinct values is large
+    val maxValues = df.sparkSession.sessionState.conf.dataFramePivotMaxValues
+    // Get the distinct values of the column and sort them so its consistent
+    val values = df.select(pivotColumn)
+      .distinct()
+      .limit(maxValues + 1)
+      .sort(pivotColumn) // ensure that the output columns are in a consistent logical order
+      .collect()
+      .map(_.get(0))
+      .toImmutableArraySeq
+
+    if (values.length > maxValues) {
+      throw QueryCompilationErrors.aggregationFunctionAppliedOnNonNumericColumnError(
+        pivotColumn.toString, maxValues)
+    }
+    values
   }
 
   /**

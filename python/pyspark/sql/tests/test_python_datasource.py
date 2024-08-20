@@ -19,7 +19,7 @@ import tempfile
 import unittest
 from typing import Callable, Union
 
-from pyspark.errors import PythonException
+from pyspark.errors import PythonException, AnalysisException
 from pyspark.sql.datasource import (
     DataSource,
     DataSourceReader,
@@ -28,6 +28,7 @@ from pyspark.sql.datasource import (
     WriterCommitMessage,
     CaseInsensitiveDict,
 )
+from pyspark.sql.functions import spark_partition_id
 from pyspark.sql.types import Row, StructType
 from pyspark.testing.sqlutils import (
     have_pyarrow,
@@ -153,7 +154,8 @@ class BasePythonDataSourceTestsMixin:
             read_func=lambda schema, partition: iter([Row(i=1, j=2), Row(j=3, k=4)])
         )
         with self.assertRaisesRegex(
-            PythonException, "PYTHON_DATA_SOURCE_READ_RETURN_SCHEMA_MISMATCH"
+            PythonException,
+            r"\[DATA_SOURCE_RETURN_SCHEMA_MISMATCH\] Return schema mismatch in the result",
         ):
             self.spark.read.format("test").load().show()
 
@@ -236,12 +238,12 @@ class BasePythonDataSourceTestsMixin:
 
         self.spark.dataSource.register(InMemoryDataSource)
         df = self.spark.read.format("memory").load()
-        self.assertEqual(df.rdd.getNumPartitions(), 3)
+        self.assertEqual(df.select(spark_partition_id()).distinct().count(), 3)
         assertDataFrameEqual(df, [Row(x=0, y="0"), Row(x=1, y="1"), Row(x=2, y="2")])
 
         df = self.spark.read.format("memory").option("num_partitions", 2).load()
         assertDataFrameEqual(df, [Row(x=0, y="0"), Row(x=1, y="1")])
-        self.assertEqual(df.rdd.getNumPartitions(), 2)
+        self.assertEqual(df.select(spark_partition_id()).distinct().count(), 2)
 
     def _get_test_json_data_source(self):
         import json
@@ -329,14 +331,14 @@ class BasePythonDataSourceTestsMixin:
         self.spark.dataSource.register(data_source)
         input_path = os.path.join(SPARK_HOME, "python/test_support/sql/people.json")
         df = self.spark.read.json(input_path)
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(prefix="test_custom_json_data_source_write") as d:
             df.write.format("my-json").mode("append").save(d)
             assertDataFrameEqual(self.spark.read.json(d), self.spark.read.json(input_path))
 
     def test_custom_json_data_source_commit(self):
         data_source = self._get_test_json_data_source()
         self.spark.dataSource.register(data_source)
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(prefix="test_custom_json_data_source_commit") as d:
             self.spark.range(0, 5, 1, 3).write.format("my-json").mode("append").save(d)
             with open(os.path.join(d, "_success.txt"), "r") as file:
                 text = file.read()
@@ -345,7 +347,7 @@ class BasePythonDataSourceTestsMixin:
     def test_custom_json_data_source_abort(self):
         data_source = self._get_test_json_data_source()
         self.spark.dataSource.register(data_source)
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(prefix="test_custom_json_data_source_abort") as d:
             with self.assertRaises(PythonException):
                 self.spark.range(0, 8, 1, 3).write.format("my-json").mode("append").save(d)
             with open(os.path.join(d, "_failed.txt"), "r") as file:
@@ -371,6 +373,47 @@ class BasePythonDataSourceTestsMixin:
         d2 = d.copy()
         self.assertEqual(d2["BaR"], 3)
         self.assertEqual(d2["baz"], 3)
+
+    def test_data_source_type_mismatch(self):
+        class TestDataSource(DataSource):
+            @classmethod
+            def name(cls):
+                return "test"
+
+            def schema(self):
+                return "id int"
+
+            def reader(self, schema):
+                return TestReader()
+
+            def writer(self, schema, overwrite):
+                return TestWriter()
+
+        class TestReader:
+            def partitions(self):
+                return []
+
+            def read(self, partition):
+                yield (0,)
+
+        class TestWriter:
+            def write(self, iterator):
+                return WriterCommitMessage()
+
+        self.spark.dataSource.register(TestDataSource)
+
+        with self.assertRaisesRegex(
+            AnalysisException,
+            r"\[DATA_SOURCE_TYPE_MISMATCH\] Expected an instance of DataSourceReader",
+        ):
+            self.spark.read.format("test").load().show()
+
+        df = self.spark.range(10)
+        with self.assertRaisesRegex(
+            AnalysisException,
+            r"\[DATA_SOURCE_TYPE_MISMATCH\] Expected an instance of DataSourceWriter",
+        ):
+            df.write.format("test").mode("append").saveAsTable("test_table")
 
 
 class PythonDataSourceTests(BasePythonDataSourceTestsMixin, ReusedSQLTestCase):

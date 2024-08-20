@@ -21,6 +21,7 @@ import java.io.{Externalizable, ObjectInput, ObjectOutput}
 import java.sql.{Date, Timestamp}
 
 import scala.collection.immutable.HashSet
+import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
 import scala.util.Random
 
@@ -29,7 +30,7 @@ import org.scalatest.Assertions._
 import org.scalatest.exceptions.TestFailedException
 import org.scalatest.prop.TableDrivenPropertyChecks._
 
-import org.apache.spark.{SparkConf, SparkException, SparkUnsupportedOperationException, TaskContext}
+import org.apache.spark.{SparkConf, SparkRuntimeException, SparkUnsupportedOperationException, TaskContext}
 import org.apache.spark.TestUtils.withListener
 import org.apache.spark.internal.config.MAX_RESULT_SIZE
 import org.apache.spark.scheduler.{SparkListener, SparkListenerJobStart}
@@ -37,7 +38,7 @@ import org.apache.spark.sql.catalyst.{FooClassWithEnum, FooEnum, ScroogeLikeExam
 import org.apache.spark.sql.catalyst.encoders.{AgnosticEncoders, ExpressionEncoder, OuterScopes}
 import org.apache.spark.sql.catalyst.encoders.AgnosticEncoders.BoxedIntEncoder
 import org.apache.spark.sql.catalyst.expressions.{CodegenObjectFactoryMode, GenericRowWithSchema}
-import org.apache.spark.sql.catalyst.plans.{LeftAnti, LeftSemi}
+import org.apache.spark.sql.catalyst.plans.JoinType
 import org.apache.spark.sql.catalyst.trees.DataFrameQueryContext
 import org.apache.spark.sql.catalyst.util.sideBySide
 import org.apache.spark.sql.execution.{LogicalRDD, RDDScanExec, SQLExecution}
@@ -542,25 +543,20 @@ class DatasetSuite extends QueryTest
     val ds1 = Seq(1, 2, 3).toDS().as("a")
     val ds2 = Seq(1, 2).toDS().as("b")
 
-    val e1 = intercept[AnalysisException] {
-      ds1.joinWith(ds2, $"a.value" === $"b.value", "left_semi")
-    }.getMessage
-    assert(e1.contains("Invalid join type in joinWith: " + LeftSemi.sql))
+    def checkJoinWithJoinType(joinType: String): Unit = {
+      val semiErrorParameters = Map("joinType" -> JoinType(joinType).sql)
+      checkError(
+        exception = intercept[AnalysisException](
+          ds1.joinWith(ds2, $"a.value" === $"b.value", joinType)
+        ),
+        errorClass = "INVALID_JOIN_TYPE_FOR_JOINWITH",
+        sqlState = "42613",
+        parameters = semiErrorParameters
+      )
+    }
 
-    val e2 = intercept[AnalysisException] {
-      ds1.joinWith(ds2, $"a.value" === $"b.value", "semi")
-    }.getMessage
-    assert(e2.contains("Invalid join type in joinWith: " + LeftSemi.sql))
-
-    val e3 = intercept[AnalysisException] {
-      ds1.joinWith(ds2, $"a.value" === $"b.value", "left_anti")
-    }.getMessage
-    assert(e3.contains("Invalid join type in joinWith: " + LeftAnti.sql))
-
-    val e4 = intercept[AnalysisException] {
-      ds1.joinWith(ds2, $"a.value" === $"b.value", "anti")
-    }.getMessage
-    assert(e4.contains("Invalid join type in joinWith: " + LeftAnti.sql))
+    Seq("leftsemi", "left_semi", "semi", "leftanti", "left_anti", "anti")
+      .foreach(checkJoinWithJoinType(_))
   }
 
   test("groupBy function, keys") {
@@ -957,6 +953,25 @@ class DatasetSuite extends QueryTest
     assert(result2.length == 3)
   }
 
+  test("SPARK-48718: cogroup deserializer expr is resolved before dedup relation") {
+    val lhs = spark.createDataFrame(
+      List(Row(123L)).asJava,
+      StructType(Seq(StructField("GROUPING_KEY", LongType)))
+    )
+    val rhs = spark.createDataFrame(
+      List(Row(0L, 123L)).asJava,
+      StructType(Seq(StructField("ID", LongType), StructField("GROUPING_KEY", LongType)))
+    )
+
+    val lhsKV = lhs.groupByKey((r: Row) => r.getAs[Long]("GROUPING_KEY"))
+    val rhsKV = rhs.groupByKey((r: Row) => r.getAs[Long]("GROUPING_KEY"))
+    val cogrouped = lhsKV.cogroup(rhsKV)(
+      (a: Long, b: Iterator[Row], c: Iterator[Row]) => Iterator(0L)
+    )
+    val joined = rhs.join(cogrouped, col("ID") === col("value"), "left")
+    checkAnswer(joined, Row(0L, 123L, 0L) :: Nil)
+  }
+
   test("SPARK-34806: observation on datasets") {
     val namedObservation = Observation("named")
     val unnamedObservation = Observation()
@@ -1251,11 +1266,10 @@ class DatasetSuite extends QueryTest
     // Shouldn't throw runtime exception when parent object (`ClassData`) is null
     assert(buildDataset(Row(null)).collect() === Array(NestedStruct(null)))
 
-    val message = intercept[RuntimeException] {
+    // Just check the error class here to avoid flakiness due to different parameters.
+    assert(intercept[SparkRuntimeException] {
       buildDataset(Row(Row("hello", null))).collect()
-    }.getCause.getMessage
-
-    assert(message.contains("Null value appeared in non-nullable field"))
+    }.getErrorClass == "NOT_NULL_ASSERT_VIOLATION")
   }
 
   test("SPARK-12478: top level null field") {
@@ -1395,10 +1409,11 @@ class DatasetSuite extends QueryTest
   test("row nullability mismatch") {
     val schema = new StructType().add("a", StringType, true).add("b", StringType, false)
     val rdd = spark.sparkContext.parallelize(Row(null, "123") :: Row("234", null) :: Nil)
-    val message = intercept[Exception] {
+    val ex = intercept[SparkRuntimeException] {
       spark.createDataFrame(rdd, schema).collect()
-    }.getMessage
-    assert(message.contains("The 1th field 'b' of input row cannot be null"))
+    }
+    assert(ex.getErrorClass == "EXPRESSION_ENCODING_FAILED")
+    assert(ex.getCause.getMessage.contains("The 1th field 'b' of input row cannot be null"))
   }
 
   test("createTempView") {
@@ -1419,18 +1434,20 @@ class DatasetSuite extends QueryTest
     dataset.sparkSession.catalog.dropTempView("tempView")
 
     withDatabase("test_db") {
-      withSQLConf(SQLConf.ALLOW_TEMP_VIEW_CREATION_WITH_MULTIPLE_NAME_PARTS.key -> "false") {
-        spark.sql("CREATE DATABASE IF NOT EXISTS test_db")
-        val e = intercept[AnalysisException](
-          dataset.createTempView("test_db.tempView"))
-        checkError(e,
-          errorClass = "TEMP_VIEW_NAME_TOO_MANY_NAME_PARTS",
-          parameters = Map("actualName" -> "test_db.tempView"))
-      }
+      withTempView("tempView") {
+        withSQLConf(SQLConf.ALLOW_TEMP_VIEW_CREATION_WITH_MULTIPLE_NAME_PARTS.key -> "false") {
+          spark.sql("CREATE DATABASE IF NOT EXISTS test_db")
+          val e = intercept[AnalysisException](
+            dataset.createTempView("test_db.tempView"))
+          checkError(e,
+            errorClass = "TEMP_VIEW_NAME_TOO_MANY_NAME_PARTS",
+            parameters = Map("actualName" -> "test_db.tempView"))
+        }
 
-      withSQLConf(SQLConf.ALLOW_TEMP_VIEW_CREATION_WITH_MULTIPLE_NAME_PARTS.key -> "true") {
-          dataset.createTempView("test_db.tempView")
-          assert(spark.catalog.tableExists("tempView"))
+        withSQLConf(SQLConf.ALLOW_TEMP_VIEW_CREATION_WITH_MULTIPLE_NAME_PARTS.key -> "true") {
+            dataset.createTempView("test_db.tempView")
+            assert(spark.catalog.tableExists("tempView"))
+        }
       }
     }
   }
@@ -1590,9 +1607,8 @@ class DatasetSuite extends QueryTest
   }
 
   test("Dataset should throw RuntimeException if top-level product input object is null") {
-    val e = intercept[RuntimeException](Seq(ClassData("a", 1), null).toDS())
-    assert(e.getCause.getMessage.contains("Null value appeared in non-nullable field"))
-    assert(e.getCause.getMessage.contains("top level Product or row object"))
+    val e = intercept[SparkRuntimeException](Seq(ClassData("a", 1), null).toDS())
+    assert(e.getErrorClass == "NOT_NULL_ASSERT_VIOLATION")
   }
 
   test("dropDuplicates") {
@@ -1882,21 +1898,24 @@ class DatasetSuite extends QueryTest
   }
 
   test("SPARK-19896: cannot have circular references in case class") {
-    val errMsg1 = intercept[UnsupportedOperationException] {
-      Seq(CircularReferenceClassA(null)).toDS()
-    }
-    assert(errMsg1.getMessage.startsWith("cannot have circular references in class, but got the " +
-      "circular reference of class"))
-    val errMsg2 = intercept[UnsupportedOperationException] {
-      Seq(CircularReferenceClassC(null)).toDS()
-    }
-    assert(errMsg2.getMessage.startsWith("cannot have circular references in class, but got the " +
-      "circular reference of class"))
-    val errMsg3 = intercept[UnsupportedOperationException] {
-      Seq(CircularReferenceClassD(null)).toDS()
-    }
-    assert(errMsg3.getMessage.startsWith("cannot have circular references in class, but got the " +
-      "circular reference of class"))
+    checkError(
+      exception = intercept[SparkUnsupportedOperationException] {
+        Seq(CircularReferenceClassA(null)).toDS()
+      },
+      errorClass = "_LEGACY_ERROR_TEMP_2139",
+      parameters = Map("t" -> "org.apache.spark.sql.CircularReferenceClassA"))
+    checkError(
+      exception = intercept[SparkUnsupportedOperationException] {
+        Seq(CircularReferenceClassC(null)).toDS()
+      },
+      errorClass = "_LEGACY_ERROR_TEMP_2139",
+      parameters = Map("t" -> "org.apache.spark.sql.CircularReferenceClassC"))
+    checkError(
+      exception = intercept[SparkUnsupportedOperationException] {
+        Seq(CircularReferenceClassD(null)).toDS()
+      },
+      errorClass = "_LEGACY_ERROR_TEMP_2139",
+      parameters = Map("t" -> "org.apache.spark.sql.CircularReferenceClassD"))
   }
 
   test("SPARK-20125: option of map") {
@@ -2032,19 +2051,34 @@ class DatasetSuite extends QueryTest
   test("SPARK-22472: add null check for top-level primitive values") {
     // If the primitive values are from Option, we need to do runtime null check.
     val ds = Seq(Some(1), None).toDS().as[Int]
-    val e1 = intercept[RuntimeException](ds.collect())
-    assert(e1.getCause.isInstanceOf[NullPointerException])
-    val e2 = intercept[SparkException](ds.map(_ * 2).collect())
-    assert(e2.getCause.isInstanceOf[NullPointerException])
+    val errorClass = "NOT_NULL_ASSERT_VIOLATION"
+    val sqlState = "42000"
+    val parameters = Map("walkedTypePath" -> "\n- root class: \"int\"\n")
+    checkError(
+      exception = intercept[SparkRuntimeException](ds.collect()),
+      errorClass = errorClass,
+      sqlState = sqlState,
+      parameters = parameters)
+    checkError(
+      exception = intercept[SparkRuntimeException](ds.map(_ * 2).collect()),
+      errorClass = errorClass,
+      sqlState = sqlState,
+      parameters = parameters)
 
     withTempPath { path =>
       Seq(Integer.valueOf(1), null).toDF("i").write.parquet(path.getCanonicalPath)
       // If the primitive values are from files, we need to do runtime null check.
       val ds = spark.read.parquet(path.getCanonicalPath).as[Int]
-      val e1 = intercept[RuntimeException](ds.collect())
-      assert(e1.getCause.isInstanceOf[NullPointerException])
-      val e2 = intercept[SparkException](ds.map(_ * 2).collect())
-      assert(e2.getCause.isInstanceOf[NullPointerException])
+      checkError(
+        exception = intercept[SparkRuntimeException](ds.collect()),
+        errorClass = errorClass,
+        sqlState = sqlState,
+        parameters = parameters)
+      checkError(
+        exception = intercept[SparkRuntimeException](ds.map(_ * 2).collect()),
+        errorClass = errorClass,
+        sqlState = sqlState,
+        parameters = parameters)
     }
   }
 
@@ -2062,8 +2096,8 @@ class DatasetSuite extends QueryTest
 
   test("SPARK-23835: null primitive data type should throw NullPointerException") {
     val ds = Seq[(Option[Int], Option[Int])]((Some(1), None)).toDS()
-    val e = intercept[RuntimeException](ds.as[(Int, Int)].collect())
-    assert(e.getCause.isInstanceOf[NullPointerException])
+    val exception = intercept[SparkRuntimeException](ds.as[(Int, Int)].collect())
+    assert(exception.getErrorClass == "NOT_NULL_ASSERT_VIOLATION")
   }
 
   test("SPARK-24569: Option of primitive types are mistakenly mapped to struct type") {
@@ -2570,6 +2604,18 @@ class DatasetSuite extends QueryTest
     assert(result == expected)
   }
 
+  test("SPARK-47385: Tuple encoder with Option inputs") {
+    implicit val enc: Encoder[(SingleData, Option[SingleData])] =
+      Encoders.tuple(Encoders.product[SingleData], Encoders.product[Option[SingleData]])
+
+    val input = Seq(
+      (SingleData(1), Some(SingleData(1))),
+      (SingleData(2), None)
+    )
+    val ds = spark.createDataFrame(input).as[(SingleData, Option[SingleData])]
+    checkDataset(ds, input: _*)
+  }
+
   test("SPARK-43124: Show does not trigger job execution on CommandResults") {
     withSQLConf(SQLConf.OPTIMIZER_EXCLUDED_RULES.key -> "") {
       withTable("t1") {
@@ -2712,6 +2758,25 @@ class DatasetSuite extends QueryTest
     val ds = Seq(WithSet(0, HashSet("foo", "bar")), WithSet(1, HashSet("bar", "zoo"))).toDS()
     checkDataset(ds.map(t => t),
       WithSet(0, HashSet("foo", "bar")), WithSet(1, HashSet("bar", "zoo")))
+  }
+
+  test("SPARK-47270: isEmpty does not trigger job execution on CommandResults") {
+    withSQLConf(SQLConf.OPTIMIZER_EXCLUDED_RULES.key -> "") {
+      withTable("t1") {
+        sql("create table t1(c int) using parquet")
+
+        @volatile var jobCounter = 0
+        val listener = new SparkListener {
+          override def onJobStart(jobStart: SparkListenerJobStart): Unit = {
+            jobCounter += 1
+          }
+        }
+        withListener(spark.sparkContext, listener) { _ =>
+          sql("show tables").isEmpty
+        }
+        assert(jobCounter === 0)
+      }
+    }
   }
 }
 

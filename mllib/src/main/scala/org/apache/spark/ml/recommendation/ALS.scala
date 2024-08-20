@@ -33,7 +33,8 @@ import org.json4s.JsonDSL._
 
 import org.apache.spark.{Partitioner, SparkException}
 import org.apache.spark.annotation.Since
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys.PATH
 import org.apache.spark.ml.{Estimator, Model}
 import org.apache.spark.ml.linalg.BLAS
 import org.apache.spark.ml.param._
@@ -555,7 +556,7 @@ object ALSModel extends MLReadable[ALSModel] {
 
     override protected def saveImpl(path: String): Unit = {
       val extraMetadata = "rank" -> instance.rank
-      DefaultParamsWriter.saveMetadata(instance, path, sc, Some(extraMetadata))
+      DefaultParamsWriter.saveMetadata(instance, path, sparkSession, Some(extraMetadata))
       val userPath = new Path(path, "userFactors").toString
       instance.userFactors.write.format("parquet").save(userPath)
       val itemPath = new Path(path, "itemFactors").toString
@@ -569,7 +570,7 @@ object ALSModel extends MLReadable[ALSModel] {
     private val className = classOf[ALSModel].getName
 
     override def load(path: String): ALSModel = {
-      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+      val metadata = DefaultParamsReader.loadMetadata(path, sparkSession, className)
       implicit val format = DefaultFormats
       val rank = (metadata.metadata \ "rank").extract[Int]
       val userPath = new Path(path, "userFactors").toString
@@ -1027,7 +1028,7 @@ object ALS extends DefaultParamsReadable[ALS] with Logging {
           checkpointFile.getFileSystem(sc.hadoopConfiguration).delete(checkpointFile, true)
         } catch {
           case e: IOException =>
-            logWarning(s"Cannot delete checkpoint file $file:", e)
+            logWarning(log"Cannot delete checkpoint file ${MDC(PATH, file)}:", e)
         }
       }
 

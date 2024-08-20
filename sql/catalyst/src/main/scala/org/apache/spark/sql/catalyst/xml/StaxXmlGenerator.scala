@@ -22,9 +22,9 @@ import javax.xml.stream.XMLOutputFactory
 
 import scala.collection.Map
 
-import com.sun.xml.txw2.output.IndentingXMLStreamWriter
 import org.apache.hadoop.shaded.com.ctc.wstx.api.WstxOutputProperties
 
+import org.apache.spark.SparkIllegalArgumentException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.util.{ArrayData, DateFormatter, DateTimeUtils, MapData, TimestampFormatter}
 import org.apache.spark.sql.catalyst.util.LegacyDateFormats.FAST_DATE_FORMAT
@@ -168,8 +168,8 @@ class StaxXmlGenerator(
 
   def writeElement(dt: DataType, v: Any, options: XmlOptions): Unit = (dt, v) match {
     case (_, null) | (NullType, _) => gen.writeCharacters(options.nullValue)
-    case (StringType, v: UTF8String) => gen.writeCharacters(v.toString)
-    case (StringType, v: String) => gen.writeCharacters(v)
+    case (_: StringType, v: UTF8String) => gen.writeCharacters(v.toString)
+    case (_: StringType, v: String) => gen.writeCharacters(v)
     case (TimestampType, v: Timestamp) =>
       gen.writeCharacters(timestampFormatter.format(v.toInstant()))
     case (TimestampType, v: Long) =>
@@ -219,8 +219,12 @@ class StaxXmlGenerator(
       }
 
     case (_, _) =>
-      throw new IllegalArgumentException(
-        s"Failed to convert value $v (class of ${v.getClass}) in type $dt to XML.")
+      throw new SparkIllegalArgumentException(
+        errorClass = "_LEGACY_ERROR_TEMP_3238",
+        messageParameters = scala.collection.immutable.Map(
+          "v" -> v.toString,
+          "class" -> v.getClass.toString,
+          "dt" -> dt.toString))
   }
 
   def writeMapData(mapType: MapType, map: MapData): Unit = {

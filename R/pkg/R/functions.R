@@ -1558,6 +1558,9 @@ setMethod("max",
 #' @details
 #' \code{max_by}: Returns the value associated with the maximum value of ord.
 #'
+#' Note: The function is non-deterministic so the output order can be different
+#' for those associated the same values of `x`.
+#'
 #' @rdname column_aggregate_functions
 #' @aliases max_by max_by,Column-method
 #' @note max_by since 3.3.0
@@ -1632,6 +1635,9 @@ setMethod("min",
 
 #' @details
 #' \code{min_by}: Returns the value associated with the minimum value of ord.
+#'
+#' Note: The function is non-deterministic so the output order can be different
+#' for those associated the same values of `x`.
 #'
 #' @rdname column_aggregate_functions
 #' @aliases min_by min_by,Column-method
@@ -2513,6 +2519,35 @@ setMethod("upper",
           signature(x = "Column"),
           function(x) {
             jc <- callJStatic("org.apache.spark.sql.functions", "upper", x@jc)
+            column(jc)
+          })
+
+#' @details
+#' \code{collate}: Marks a given column with specified collation.
+#'
+#' @param x a Column on which to perform collate.
+#' @param collation specified collation name.
+#' @rdname column_string_functions
+#' @aliases collate collate,Column-method
+#' @note collate since 4.0.0
+setMethod("collate",
+          signature(x = "Column", collation = "character"),
+          function(x, collation) {
+            jc <- callJStatic("org.apache.spark.sql.functions", "collate", x@jc, collation)
+            column(jc)
+          })
+
+#' @details
+#' \code{collation}: Returns the collation name of a given column.
+#'
+#' @param x a Column on which to return collation name.
+#' @rdname column_string_functions
+#' @aliases collation collation,Column-method
+#' @note collation since 4.0.0
+setMethod("collation",
+          signature(x = "Column"),
+          function(x) {
+            jc <- callJStatic("org.apache.spark.sql.functions", "collation", x@jc)
             column(jc)
           })
 
@@ -3930,19 +3965,11 @@ setMethod("row_number",
 #'        yields unresolved \code{a.b.c}
 #' @return Column object wrapping JVM UnresolvedNamedLambdaVariable
 #' @keywords internal
-unresolved_named_lambda_var <- function(...) {
-  jc <- newJObject(
-    "org.apache.spark.sql.Column",
-    newJObject(
-      "org.apache.spark.sql.catalyst.expressions.UnresolvedNamedLambdaVariable",
-      lapply(list(...), function(x) {
-        handledCallJStatic(
-          "org.apache.spark.sql.catalyst.expressions.UnresolvedNamedLambdaVariable",
-          "freshVarName",
-          x)
-      })
-    )
-  )
+unresolved_named_lambda_var <- function(name) {
+  jc <- handledCallJStatic(
+    "org.apache.spark.sql.api.python.PythonSQLUtils",
+    "unresolvedNamedLambdaVariable",
+    name)
   column(jc)
 }
 
@@ -3955,7 +3982,6 @@ unresolved_named_lambda_var <- function(...) {
 #' @return JVM \code{LambdaFunction} object
 #' @keywords internal
 create_lambda <- function(fun) {
-  as_jexpr <- function(x) callJMethod(x@jc, "expr")
 
   # Process function arguments
   parameters <- formals(fun)
@@ -3976,22 +4002,18 @@ create_lambda <- function(fun) {
   stopifnot(class(result) == "Column")
 
   # Convert both Columns to Scala expressions
-  jexpr <- as_jexpr(result)
-
   jargs <- handledCallJStatic(
     "org.apache.spark.api.python.PythonUtils",
     "toSeq",
-    handledCallJStatic(
-      "java.util.Arrays", "asList", lapply(args, as_jexpr)
-    )
+    handledCallJStatic("java.util.Arrays", "asList", lapply(args, function(x) { x@jc }))
   )
 
   # Create Scala LambdaFunction
-  newJObject(
-    "org.apache.spark.sql.catalyst.expressions.LambdaFunction",
-    jexpr,
-    jargs,
-    FALSE
+  handledCallJStatic(
+    "org.apache.spark.sql.api.python.PythonSQLUtils",
+    "lambdaFunction",
+    result@jc,
+    jargs
   )
 }
 
@@ -4004,20 +4026,18 @@ create_lambda <- function(fun) {
 #' @return a \code{Column} representing name applied to cols with funs
 #' @keywords internal
 invoke_higher_order_function <- function(name, cols, funs) {
-  as_jexpr <- function(x) {
+  as_col <- function(x) {
     if (class(x) == "character") {
       x <- column(x)
     }
-    callJMethod(x@jc, "expr")
+    x@jc
   }
-
-  jexpr <- do.call(newJObject, c(
-    paste("org.apache.spark.sql.catalyst.expressions", name, sep = "."),
-    lapply(cols, as_jexpr),
-    lapply(funs, create_lambda)
-  ))
-
-  column(newJObject("org.apache.spark.sql.Column", jexpr))
+  jcol <- handledCallJStatic(
+    "org.apache.spark.sql.api.python.PythonSQLUtils",
+    "fn",
+    name,
+    c(lapply(cols, as_col), lapply(funs, create_lambda))) # check varargs invocation
+  column(jcol)
 }
 
 #' @details
@@ -4033,7 +4053,7 @@ setMethod("array_aggregate",
           signature(x = "characterOrColumn", initialValue = "Column", merge = "function"),
           function(x, initialValue, merge, finish = NULL) {
             invoke_higher_order_function(
-              "ArrayAggregate",
+              "aggregate",
               cols = list(x, initialValue),
               funs = if (is.null(finish)) {
                 list(merge)
@@ -4094,7 +4114,7 @@ setMethod("array_exists",
           signature(x = "characterOrColumn", f = "function"),
           function(x, f) {
             invoke_higher_order_function(
-              "ArrayExists",
+              "exists",
               cols = list(x),
               funs = list(f)
             )
@@ -4110,7 +4130,7 @@ setMethod("array_filter",
           signature(x = "characterOrColumn", f = "function"),
           function(x, f) {
             invoke_higher_order_function(
-              "ArrayFilter",
+              "filter",
               cols = list(x),
               funs = list(f)
             )
@@ -4126,7 +4146,7 @@ setMethod("array_forall",
           signature(x = "characterOrColumn", f = "function"),
           function(x, f) {
             invoke_higher_order_function(
-              "ArrayForAll",
+              "forall",
               cols = list(x),
               funs = list(f)
             )
@@ -4256,7 +4276,7 @@ setMethod("array_sort",
                column(callJStatic("org.apache.spark.sql.functions", "array_sort", x@jc))
             } else {
               invoke_higher_order_function(
-                "ArraySort",
+                "array_sort",
                 cols = list(x),
                 funs = list(comparator)
               )
@@ -4274,7 +4294,7 @@ setMethod("array_transform",
           signature(x = "characterOrColumn", f = "function"),
           function(x, f) {
             invoke_higher_order_function(
-              "ArrayTransform",
+              "transform",
               cols = list(x),
               funs = list(f)
             )
@@ -4339,7 +4359,7 @@ setMethod("arrays_zip_with",
           signature(x = "characterOrColumn", y = "characterOrColumn", f = "function"),
           function(x, y, f) {
             invoke_higher_order_function(
-              "ZipWith",
+              "zip_with",
               cols = list(x, y),
               funs = list(f)
             )
@@ -4412,7 +4432,7 @@ setMethod("map_filter",
           signature(x = "characterOrColumn", f = "function"),
           function(x, f) {
             invoke_higher_order_function(
-              "MapFilter",
+              "map_filter",
               cols = list(x),
               funs = list(f))
           })
@@ -4469,7 +4489,7 @@ setMethod("transform_keys",
           signature(x = "characterOrColumn", f = "function"),
           function(x, f) {
             invoke_higher_order_function(
-              "TransformKeys",
+              "transform_keys",
               cols = list(x),
               funs = list(f)
             )
@@ -4486,7 +4506,7 @@ setMethod("transform_values",
           signature(x = "characterOrColumn", f = "function"),
           function(x, f) {
             invoke_higher_order_function(
-              "TransformValues",
+              "transform_values",
               cols = list(x),
               funs = list(f)
            )
@@ -4517,7 +4537,7 @@ setMethod("map_zip_with",
           signature(x = "characterOrColumn", y = "characterOrColumn", f = "function"),
           function(x, y, f) {
             invoke_higher_order_function(
-              "MapZipWith",
+              "map_zip_with",
               cols = list(x, y),
               funs = list(f)
            )

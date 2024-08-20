@@ -20,6 +20,7 @@ package org.apache.spark.sql.catalyst.encoders
 import scala.reflect.ClassTag
 import scala.reflect.runtime.universe.TypeTag
 
+import org.apache.spark.SparkRuntimeException
 import org.apache.spark.sql.{Encoder, Row}
 import org.apache.spark.sql.catalyst.{DeserializerBuildHelper, InternalRow, JavaTypeInference, ScalaReflection, SerializerBuildHelper}
 import org.apache.spark.sql.catalyst.analysis.{Analyzer, GetColumnByOrdinal, SimpleAnalyzer, UnresolvedAttribute, UnresolvedExtractValue}
@@ -73,8 +74,14 @@ object ExpressionEncoder {
    * Given a set of N encoders, constructs a new encoder that produce objects as items in an
    * N-tuple.  Note that these encoders should be unresolved so that information about
    * name/positional binding is preserved.
+   * When `useNullSafeDeserializer` is true, the deserialization result for a child will be null if
+   * the input is null. It is false by default as most deserializers handle null input properly and
+   * don't require an extra null check. Some of them are null-tolerant, such as the deserializer for
+   * `Option[T]`, and we must not set it to true in this case.
    */
-  def tuple(encoders: Seq[ExpressionEncoder[_]]): ExpressionEncoder[_] = {
+  def tuple(
+      encoders: Seq[ExpressionEncoder[_]],
+      useNullSafeDeserializer: Boolean = false): ExpressionEncoder[_] = {
     if (encoders.length > 22) {
       throw QueryExecutionErrors.elementsOfTupleExceedLimitError()
     }
@@ -119,7 +126,7 @@ object ExpressionEncoder {
         case GetColumnByOrdinal(0, _) => input
       }
 
-      if (enc.objSerializer.nullable) {
+      if (useNullSafeDeserializer && enc.objSerializer.nullable) {
         nullSafe(input, childDeserializer)
       } else {
         childDeserializer
@@ -181,6 +188,8 @@ object ExpressionEncoder {
       }
       constructProjection(row).get(0, anyObjectType).asInstanceOf[T]
     } catch {
+      case e: SparkRuntimeException if e.getErrorClass == "NOT_NULL_ASSERT_VIOLATION" =>
+        throw e
       case e: Exception =>
         throw QueryExecutionErrors.expressionDecodingError(e, expressions)
     }
@@ -207,6 +216,8 @@ object ExpressionEncoder {
       inputRow(0) = t
       extractProjection(inputRow)
     } catch {
+      case e: SparkRuntimeException if e.getErrorClass == "NOT_NULL_ASSERT_VIOLATION" =>
+        throw e
       case e: Exception =>
         throw QueryExecutionErrors.expressionEncodingError(e, expressions)
     }
@@ -408,7 +419,7 @@ case class ExpressionEncoder[T](
    * has not been done already in places where we plan to do later composition of encoders.
    */
   def assertUnresolved(): Unit = {
-    (deserializer +:  serializer).foreach(_.foreach {
+    (deserializer +: serializer).foreach(_.foreach {
       case a: AttributeReference if a.name != "loopVar" =>
         throw QueryExecutionErrors.notExpectedUnresolvedEncoderError(a)
       case _ =>

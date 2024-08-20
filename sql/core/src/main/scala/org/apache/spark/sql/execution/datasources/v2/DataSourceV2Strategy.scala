@@ -19,10 +19,11 @@ package org.apache.spark.sql.execution.datasources.v2
 
 import scala.collection.mutable
 
-import org.apache.commons.lang3.StringUtils
+import org.apache.hadoop.fs.Path
 
 import org.apache.spark.SparkException
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys.EXPR
 import org.apache.spark.sql.{SparkSession, Strategy}
 import org.apache.spark.sql.catalyst.analysis.{ResolvedIdentifier, ResolvedNamespace, ResolvedPartitionSpec, ResolvedTable}
 import org.apache.spark.sql.catalyst.catalog.CatalogUtils
@@ -41,6 +42,7 @@ import org.apache.spark.sql.connector.read.streaming.{ContinuousStream, MicroBat
 import org.apache.spark.sql.connector.write.V1Write
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.execution.{FilterExec, InSubqueryExec, LeafExecNode, LocalTableScanExec, ProjectExec, RowDataSourceScanExec, SparkPlan}
+import org.apache.spark.sql.execution.command.CommandUtils
 import org.apache.spark.sql.execution.datasources.{DataSourceStrategy, LogicalRelation, PushableColumnAndNestedColumn}
 import org.apache.spark.sql.execution.streaming.continuous.{WriteToContinuousDataSource, WriteToContinuousDataSourceExec}
 import org.apache.spark.sql.internal.StaticSQLConf.WAREHOUSE_PATH
@@ -53,20 +55,7 @@ class DataSourceV2Strategy(session: SparkSession) extends Strategy with Predicat
   import DataSourceV2Implicits._
   import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
 
-  private def withProjectAndFilter(
-      project: Seq[NamedExpression],
-      filters: Seq[Expression],
-      scan: LeafExecNode,
-      needsUnsafeConversion: Boolean): SparkPlan = {
-    val filterCondition = filters.reduceLeftOption(And)
-    val withFilter = filterCondition.map(FilterExec(_, scan)).getOrElse(scan)
-
-    if (withFilter.output != project || needsUnsafeConversion) {
-      ProjectExec(project, withFilter)
-    } else {
-      withFilter
-    }
-  }
+  private def hadoopConf = session.sessionState.newHadoopConf()
 
   private def refreshCache(r: DataSourceV2Relation)(): Unit = {
     session.sharedState.cacheManager.recacheByPlan(session, r)
@@ -81,7 +70,7 @@ class DataSourceV2Strategy(session: SparkSession) extends Strategy with Predicat
   // given table, the cache's storage level is returned.
   private def invalidateTableCache(r: ResolvedTable)(): Option[StorageLevel] = {
     val v2Relation = DataSourceV2Relation.create(r.table, Some(r.catalog), Some(r.identifier))
-    val cache = session.sharedState.cacheManager.lookupCachedData(v2Relation)
+    val cache = session.sharedState.cacheManager.lookupCachedData(session, v2Relation)
     session.sharedState.cacheManager.uncacheQuery(session, v2Relation, cascade = true)
     if (cache.isDefined) {
       val cacheLevel = cache.get.cachedRepresentation.cacheBuilder.storageLevel
@@ -102,12 +91,24 @@ class DataSourceV2Strategy(session: SparkSession) extends Strategy with Predicat
   }
 
   private def qualifyLocInTableSpec(tableSpec: TableSpec): TableSpec = {
-    tableSpec.withNewLocation(tableSpec.location.map(makeQualifiedDBObjectPath(_)))
+    val newLoc = tableSpec.location.map { loc =>
+      val locationUri = CatalogUtils.stringToURI(loc)
+      val qualified = if (locationUri.isAbsolute) {
+        locationUri
+      } else if (new Path(locationUri).isAbsolute) {
+        CatalogUtils.makeQualifiedPath(locationUri, hadoopConf)
+      } else {
+        // Leave it to the catalog implementation to qualify relative paths.
+        locationUri
+      }
+      CatalogUtils.URIToString(qualified)
+    }
+    tableSpec.withNewLocation(newLoc)
   }
 
   override def apply(plan: LogicalPlan): Seq[SparkPlan] = plan match {
     case PhysicalOperation(project, filters, DataSourceV2ScanRelation(
-      _, V1ScanWrapper(scan, pushed, pushedDownOperators), output, _, _)) =>
+      v2Relation, V1ScanWrapper(scan, pushed, pushedDownOperators), output, _, _)) =>
       val v1Relation = scan.toV1TableScan[BaseRelation with TableScan](session.sqlContext)
       if (v1Relation.schema != scan.readSchema()) {
         throw QueryExecutionErrors.fallbackV1RelationReportsInconsistentSchemaError(
@@ -115,6 +116,9 @@ class DataSourceV2Strategy(session: SparkSession) extends Strategy with Predicat
       }
       val rdd = v1Relation.buildScan()
       val unsafeRowRDD = DataSourceStrategy.toCatalystRDD(v1Relation, output, rdd)
+
+      val catalogName = v2Relation.catalog.map(_.name())
+      val tableIdentifier = v2Relation.identifier.flatMap(_.asTableIdentifierOpt(catalogName))
 
       val dsScan = RowDataSourceScanExec(
         output,
@@ -124,13 +128,15 @@ class DataSourceV2Strategy(session: SparkSession) extends Strategy with Predicat
         pushedDownOperators,
         unsafeRowRDD,
         v1Relation,
-        tableIdentifier = None)
-      withProjectAndFilter(project, filters, dsScan, needsUnsafeConversion = false) :: Nil
+        tableIdentifier)
+      DataSourceV2Strategy.withProjectAndFilter(
+        project, filters, dsScan, needsUnsafeConversion = false) :: Nil
 
     case PhysicalOperation(project, filters,
         DataSourceV2ScanRelation(_, scan: LocalScan, output, _, _)) =>
       val localScanExec = LocalTableScanExec(output, scan.rows().toImmutableArraySeq)
-      withProjectAndFilter(project, filters, localScanExec, needsUnsafeConversion = false) :: Nil
+      DataSourceV2Strategy.withProjectAndFilter(
+        project, filters, localScanExec, needsUnsafeConversion = false) :: Nil
 
     case PhysicalOperation(project, filters, relation: DataSourceV2ScanRelation) =>
       // projection and filters were already pushed down in the optimizer.
@@ -143,7 +149,8 @@ class DataSourceV2Strategy(session: SparkSession) extends Strategy with Predicat
       val batchExec = BatchScanExec(relation.output, relation.scan, runtimeFilters,
         relation.ordering, relation.relation.table,
         StoragePartitionJoinParams(relation.keyGroupedPartitioning))
-      withProjectAndFilter(project, postScanFilters, batchExec, !batchExec.supportsColumnar) :: Nil
+      DataSourceV2Strategy.withProjectAndFilter(
+        project, postScanFilters, batchExec, !batchExec.supportsColumnar) :: Nil
 
     case PhysicalOperation(p, f, r: StreamingDataSourceV2ScanRelation)
       if r.startOffset.isDefined && r.endOffset.isDefined =>
@@ -153,7 +160,7 @@ class DataSourceV2Strategy(session: SparkSession) extends Strategy with Predicat
         r.output, r.scan, microBatchStream, r.startOffset.get, r.endOffset.get)
 
       // Add a Project here to make sure we produce unsafe rows.
-      withProjectAndFilter(p, f, scanExec, !scanExec.supportsColumnar) :: Nil
+      DataSourceV2Strategy.withProjectAndFilter(p, f, scanExec, !scanExec.supportsColumnar) :: Nil
 
     case PhysicalOperation(p, f, r: StreamingDataSourceV2ScanRelation)
       if r.startOffset.isDefined && r.endOffset.isEmpty =>
@@ -162,7 +169,7 @@ class DataSourceV2Strategy(session: SparkSession) extends Strategy with Predicat
       val scanExec = ContinuousScanExec(r.output, r.scan, continuousStream, r.startOffset.get)
 
       // Add a Project here to make sure we produce unsafe rows.
-      withProjectAndFilter(p, f, scanExec, !scanExec.supportsColumnar) :: Nil
+      DataSourceV2Strategy.withProjectAndFilter(p, f, scanExec, !scanExec.supportsColumnar) :: Nil
 
     case WriteToDataSourceV2(relationOpt, writer, query, customMetrics) =>
       val invalidateCacheFunc: () => Unit = () => relationOpt match {
@@ -348,10 +355,7 @@ class DataSourceV2Strategy(session: SparkSession) extends Strategy with Predicat
       }
 
     case DropTable(r: ResolvedIdentifier, ifExists, purge) =>
-      val invalidateFunc = () => session.sharedState.cacheManager.uncacheTableOrView(
-        session,
-        (r.catalog.name() +: r.identifier.namespace() :+ r.identifier.name()).toImmutableArraySeq,
-        cascade = true)
+      val invalidateFunc = () => CommandUtils.uncacheTableOrView(session, r)
       DropTableExec(r.catalog.asTableCatalog, r.identifier, ifExists, purge, invalidateFunc) :: Nil
 
     case _: NoopCommand =>
@@ -372,9 +376,6 @@ class DataSourceV2Strategy(session: SparkSession) extends Strategy with Predicat
       AlterNamespaceSetPropertiesExec(catalog.asNamespaceCatalog, ns, properties) :: Nil
 
     case SetNamespaceLocation(ResolvedNamespace(catalog, ns, _), location) =>
-      if (StringUtils.isEmpty(location)) {
-        throw QueryExecutionErrors.invalidEmptyLocationError(location)
-      }
       AlterNamespaceSetPropertiesExec(
         catalog.asNamespaceCatalog,
         ns,
@@ -387,10 +388,6 @@ class DataSourceV2Strategy(session: SparkSession) extends Strategy with Predicat
         Map(SupportsNamespaces.PROP_COMMENT -> comment)) :: Nil
 
     case CreateNamespace(ResolvedNamespace(catalog, ns, _), ifNotExists, properties) =>
-      val location = properties.get(SupportsNamespaces.PROP_LOCATION)
-      if (location.isDefined && location.get.isEmpty) {
-        throw QueryExecutionErrors.invalidEmptyLocationError(location.get)
-      }
       val finalProperties = properties.get(SupportsNamespaces.PROP_LOCATION).map { loc =>
         properties + (SupportsNamespaces.PROP_LOCATION -> makeQualifiedDBObjectPath(loc))
       }.getOrElse(properties)
@@ -480,8 +477,8 @@ class DataSourceV2Strategy(session: SparkSession) extends Strategy with Predicat
         Seq(part).asResolvedPartitionSpecs.head,
         recacheTable(r)) :: Nil
 
-    case ShowColumns(_: ResolvedTable, _, _) =>
-      throw QueryCompilationErrors.showColumnsNotSupportedForV2TablesError()
+    case ShowColumns(resolvedTable: ResolvedTable, _, output) =>
+      ShowColumnsExec(output, resolvedTable) :: Nil
 
     case r @ ShowPartitions(
         ResolvedTable(catalog, _, table: SupportsPartitionManagement, _),
@@ -649,8 +646,31 @@ private[sql] object DataSourceV2Strategy extends Logging {
       Some(new Predicate("IN", FieldReference(name) +: literals))
 
     case other =>
-      logWarning(s"Can't translate $other to source filter, unsupported expression")
+      logWarning(log"Can't translate ${MDC(EXPR, other)} to source filter, unsupported expression")
       None
+  }
+
+  /**
+   * Creates new spark plan that should apply given filters and projections to given scan node
+   * @param project Projection list that should be output of returned spark plan
+   * @param filters Filter list that should be applied to scan node
+   * @param scan Scan node
+   * @param needsUnsafeConversion Value that indicates whether unsafe conversion is needed
+   * @return SparkPlan tree composed of scan node and eventually filter/project nodes
+   */
+  protected[sql] def withProjectAndFilter(
+      project: Seq[NamedExpression],
+      filters: Seq[Expression],
+      scan: LeafExecNode,
+      needsUnsafeConversion: Boolean): SparkPlan = {
+    val filterCondition = filters.reduceLeftOption(And)
+    val withFilter = filterCondition.map(FilterExec(_, scan)).getOrElse(scan)
+
+    if (withFilter.output != project || needsUnsafeConversion) {
+      ProjectExec(project, withFilter)
+    } else {
+      withFilter
+    }
   }
 }
 

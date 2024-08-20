@@ -27,12 +27,12 @@ import org.json4s.JsonAST.JValue
 import org.json4s.JsonDSL._
 import org.json4s.jackson.JsonMethods._
 
-import org.apache.spark.SparkThrowable
+import org.apache.spark.{SparkIllegalArgumentException, SparkThrowable}
 import org.apache.spark.annotation.Stable
 import org.apache.spark.sql.catalyst.analysis.SqlApiAnalysis
 import org.apache.spark.sql.catalyst.parser.DataTypeParser
+import org.apache.spark.sql.catalyst.util.{CollationFactory, StringConcat}
 import org.apache.spark.sql.catalyst.util.DataTypeJsonUtils.{DataTypeJsonDeserializer, DataTypeJsonSerializer}
-import org.apache.spark.sql.catalyst.util.StringConcat
 import org.apache.spark.sql.errors.DataTypeErrors
 import org.apache.spark.sql.internal.SqlApiConf
 import org.apache.spark.sql.types.DayTimeIntervalType._
@@ -102,7 +102,7 @@ abstract class DataType extends AbstractDataType {
    */
   private[spark] def existsRecursively(f: (DataType) => Boolean): Boolean = f(this)
 
-  override private[sql] def defaultConcreteType: DataType = this
+  final override private[sql] def defaultConcreteType: DataType = this
 
   override private[sql] def acceptsType(other: DataType): Boolean = sameType(other)
 }
@@ -117,6 +117,8 @@ object DataType {
   private val FIXED_DECIMAL = """decimal\(\s*(\d+)\s*,\s*(\-?\d+)\s*\)""".r
   private val CHAR_TYPE = """char\(\s*(\d+)\s*\)""".r
   private val VARCHAR_TYPE = """varchar\(\s*(\d+)\s*\)""".r
+
+  val COLLATIONS_METADATA_KEY = "__COLLATIONS"
 
   def fromDDL(ddl: String): DataType = {
     parseTypeWithFallback(
@@ -146,7 +148,8 @@ object DataType {
         try {
           fallbackParser(schema)
         } catch {
-          case NonFatal(_) =>
+          case NonFatal(suppressed) =>
+            e.addSuppressed(suppressed)
             if (e.isInstanceOf[SparkThrowable]) {
               throw e
             }
@@ -190,8 +193,9 @@ object DataType {
       case "timestamp_ltz" => TimestampType
       case other => otherTypes.getOrElse(
         other,
-        throw new IllegalArgumentException(
-          s"Failed to convert the JSON string '$name' to a data type."))
+        throw new SparkIllegalArgumentException(
+          errorClass = "INVALID_JSON_DATA_TYPE",
+          messageParameters = Map("invalidType" -> name)))
     }
   }
 
@@ -203,26 +207,40 @@ object DataType {
   }
 
   // NOTE: Map fields must be sorted in alphabetical order to keep consistent with the Python side.
-  private[sql] def parseDataType(json: JValue): DataType = json match {
+  private[sql] def parseDataType(
+      json: JValue,
+      fieldPath: String = "",
+      collationsMap: Map[String, String] = Map.empty): DataType = json match {
     case JString(name) =>
-      nameToType(name)
+      collationsMap.get(fieldPath) match {
+        case Some(collation) =>
+          assertValidTypeForCollations(fieldPath, name, collationsMap)
+          stringTypeWithCollation(collation)
+        case _ => nameToType(name)
+      }
 
     case JSortedObject(
     ("containsNull", JBool(n)),
     ("elementType", t: JValue),
     ("type", JString("array"))) =>
-      ArrayType(parseDataType(t), n)
+      assertValidTypeForCollations(fieldPath, "array", collationsMap)
+      val elementType = parseDataType(t, appendFieldToPath(fieldPath, "element"), collationsMap)
+      ArrayType(elementType, n)
 
     case JSortedObject(
     ("keyType", k: JValue),
     ("type", JString("map")),
     ("valueContainsNull", JBool(n)),
     ("valueType", v: JValue)) =>
-      MapType(parseDataType(k), parseDataType(v), n)
+      assertValidTypeForCollations(fieldPath, "map", collationsMap)
+      val keyType = parseDataType(k, appendFieldToPath(fieldPath, "key"), collationsMap)
+      val valueType = parseDataType(v, appendFieldToPath(fieldPath, "value"), collationsMap)
+      MapType(keyType, valueType, n)
 
     case JSortedObject(
     ("fields", JArray(fields)),
     ("type", JString("struct"))) =>
+      assertValidTypeForCollations(fieldPath, "struct", collationsMap)
       StructType(fields.map(parseStructField))
 
     // Scala/Java UDT
@@ -241,18 +259,25 @@ object DataType {
     ("type", JString("udt"))) =>
         new PythonUserDefinedType(parseDataType(v), pyClass, serialized)
 
-    case other =>
-      throw new IllegalArgumentException(
-        s"Failed to convert the JSON string '${compact(render(other))}' to a data type.")
+    case other => throw new SparkIllegalArgumentException(
+      errorClass = "INVALID_JSON_DATA_TYPE",
+      messageParameters = Map("invalidType" -> compact(render(other))))
   }
 
   private def parseStructField(json: JValue): StructField = json match {
     case JSortedObject(
-    ("metadata", metadata: JObject),
+    ("metadata", JObject(metadataFields)),
     ("name", JString(name)),
     ("nullable", JBool(nullable)),
     ("type", dataType: JValue)) =>
-      StructField(name, parseDataType(dataType), nullable, Metadata.fromJObject(metadata))
+      val collationsMap = getCollationsMap(metadataFields)
+      val metadataWithoutCollations =
+        JObject(metadataFields.filterNot(_._1 == COLLATIONS_METADATA_KEY))
+      StructField(
+        name,
+        parseDataType(dataType, name, collationsMap),
+        nullable,
+        Metadata.fromJObject(metadataWithoutCollations))
     // Support reading schema when 'metadata' is missing.
     case JSortedObject(
     ("name", JString(name)),
@@ -264,9 +289,51 @@ object DataType {
     ("name", JString(name)),
     ("type", dataType: JValue)) =>
       StructField(name, parseDataType(dataType))
-    case other =>
-      throw new IllegalArgumentException(
-        s"Failed to convert the JSON string '${compact(render(other))}' to a field.")
+    case other => throw new SparkIllegalArgumentException(
+      errorClass = "INVALID_JSON_DATA_TYPE",
+      messageParameters = Map("invalidType" -> compact(render(other))))
+  }
+
+  private def assertValidTypeForCollations(
+      fieldPath: String,
+      fieldType: String,
+      collationMap: Map[String, String]): Unit = {
+    if (collationMap.contains(fieldPath) && fieldType != "string") {
+      throw new SparkIllegalArgumentException(
+        errorClass = "INVALID_JSON_DATA_TYPE_FOR_COLLATIONS",
+        messageParameters = Map("jsonType" -> fieldType))
+    }
+  }
+
+  /**
+   * Appends a field name to a given path, using a dot separator if the path is not empty.
+   */
+  private def appendFieldToPath(basePath: String, fieldName: String): String = {
+    if (basePath.isEmpty) fieldName else s"$basePath.$fieldName"
+  }
+
+  /**
+   * Returns a map of field path to collation name.
+   */
+  private def getCollationsMap(metadataFields: List[JField]): Map[String, String] = {
+    val collationsJsonOpt = metadataFields.find(_._1 == COLLATIONS_METADATA_KEY).map(_._2)
+    collationsJsonOpt match {
+      case Some(JObject(fields)) =>
+        fields.collect {
+          case (fieldPath, JString(collation)) =>
+            collation.split("\\.", 2) match {
+              case Array(provider: String, collationName: String) =>
+                CollationFactory.assertValidProvider(provider)
+                fieldPath -> collationName
+            }
+        }.toMap
+
+      case _ => Map.empty
+    }
+  }
+
+  private def stringTypeWithCollation(collationName: String): StringType = {
+    StringType(CollationFactory.collationNameToId(collationName))
   }
 
   protected[types] def buildFormattedString(
@@ -343,6 +410,41 @@ object DataType {
             (ignoreName || fromField.name == toField.name) &&
               (toField.nullable || !fromField.nullable) &&
               equalsIgnoreCompatibleNullability(fromField.dataType, toField.dataType, ignoreName)
+          }
+
+      case (fromDataType, toDataType) => fromDataType == toDataType
+    }
+  }
+
+  /**
+   * Check if `from` is equal to `to` type except for collations, which are checked to be
+   * compatible so that data of type `from` can be interpreted as of type `to`.
+   */
+  private[sql] def equalsIgnoreCompatibleCollation(
+      from: DataType,
+      to: DataType): Boolean = {
+    (from, to) match {
+      // String types with possibly different collations are compatible.
+      case (_: StringType, _: StringType) => true
+
+      case (ArrayType(fromElement, fromContainsNull), ArrayType(toElement, toContainsNull)) =>
+        (fromContainsNull == toContainsNull) &&
+          equalsIgnoreCompatibleCollation(fromElement, toElement)
+
+      case (MapType(fromKey, fromValue, fromContainsNull),
+          MapType(toKey, toValue, toContainsNull)) =>
+        fromContainsNull == toContainsNull &&
+          // Map keys cannot change collation.
+          fromKey == toKey &&
+          equalsIgnoreCompatibleCollation(fromValue, toValue)
+
+      case (StructType(fromFields), StructType(toFields)) =>
+        fromFields.length == toFields.length &&
+          fromFields.zip(toFields).forall { case (fromField, toField) =>
+            fromField.name == toField.name &&
+              fromField.nullable == toField.nullable &&
+              fromField.metadata == toField.metadata &&
+              equalsIgnoreCompatibleCollation(fromField.dataType, toField.dataType)
           }
 
       case (fromDataType, toDataType) => fromDataType == toDataType

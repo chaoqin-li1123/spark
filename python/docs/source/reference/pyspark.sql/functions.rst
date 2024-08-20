@@ -142,6 +142,7 @@ Mathematical Functions
     tanh
     try_add
     try_divide
+    try_mod
     try_multiply
     try_subtract
     unhex
@@ -160,6 +161,8 @@ String Functions
     char
     char_length
     character_length
+    collate
+    collation
     concat_ws
     contains
     decode
@@ -278,6 +281,8 @@ Date and Timestamp Functions
     quarter
     second
     session_window
+    timestamp_add
+    timestamp_diff
     timestamp_micros
     timestamp_millis
     timestamp_seconds
@@ -534,6 +539,20 @@ JSON Functions
     to_json
 
 
+VARIANT Functions
+-----------------
+.. autosummary::
+    :toctree: api/
+
+    is_variant_null
+    parse_json
+    schema_of_variant
+    schema_of_variant_agg
+    try_variant_get
+    variant_get
+    try_parse_json
+
+
 XML Functions
 --------------
 .. autosummary::
@@ -561,6 +580,7 @@ URL Functions
     parse_url
     url_decode
     url_encode
+    try_url_decode
 
 
 Misc Functions

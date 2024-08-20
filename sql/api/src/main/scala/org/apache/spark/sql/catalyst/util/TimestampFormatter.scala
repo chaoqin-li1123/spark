@@ -29,7 +29,7 @@ import scala.util.control.NonFatal
 
 import org.apache.commons.lang3.time.FastDateFormat
 
-import org.apache.spark.SparkException
+import org.apache.spark.{SparkException, SparkIllegalArgumentException}
 import org.apache.spark.sql.catalyst.util.DateTimeConstants._
 import org.apache.spark.sql.catalyst.util.LegacyDateFormats.{LegacyDateFormat, LENIENT_SIMPLE_DATE_FORMAT}
 import org.apache.spark.sql.catalyst.util.RebaseDateTime._
@@ -163,6 +163,9 @@ class Iso8601TimestampFormatter(
     getOrCreateFormatter(pattern, locale, isParsing)
 
   @transient
+  private lazy val zonedFormatter: DateTimeFormatter = formatter.withZone(zoneId)
+
+  @transient
   protected lazy val legacyFormatter = TimestampFormatter.getLegacyFormatter(
     pattern, zoneId, locale, legacyFormat)
 
@@ -231,7 +234,7 @@ class Iso8601TimestampFormatter(
 
   override def format(instant: Instant): String = {
     try {
-      formatter.withZone(zoneId).format(instant)
+      zonedFormatter.format(instant)
     } catch checkFormattedDiff(toJavaTimestamp(instantToMicros(instant)),
       (t: Timestamp) => format(t))
   }
@@ -408,7 +411,9 @@ class LegacyFastTimestampFormatter(
   override def parse(s: String): Long = {
     cal.clear() // Clear the calendar because it can be re-used many times
     if (!fastDateFormat.parse(s, new ParsePosition(0), cal)) {
-      throw new IllegalArgumentException(s"'$s' is an invalid timestamp")
+      throw new SparkIllegalArgumentException(
+        errorClass = "_LEGACY_ERROR_TEMP_3260",
+        messageParameters = Map("s" -> s))
     }
     extractMicros(cal)
   }
@@ -430,11 +435,11 @@ class LegacyFastTimestampFormatter(
     val micros = cal.getMicros()
     cal.set(Calendar.MILLISECOND, 0)
     val julianMicros = Math.addExact(millisToMicros(cal.getTimeInMillis), micros)
-    rebaseJulianToGregorianMicros(julianMicros)
+    rebaseJulianToGregorianMicros(TimeZone.getTimeZone(zoneId), julianMicros)
   }
 
   override def format(timestamp: Long): String = {
-    val julianMicros = rebaseGregorianToJulianMicros(timestamp)
+    val julianMicros = rebaseGregorianToJulianMicros(TimeZone.getTimeZone(zoneId), timestamp)
     cal.setTimeInMillis(Math.floorDiv(julianMicros, MICROS_PER_SECOND) * MILLIS_PER_SECOND)
     cal.setMicros(Math.floorMod(julianMicros, MICROS_PER_SECOND))
     fastDateFormat.format(cal)
@@ -444,7 +449,7 @@ class LegacyFastTimestampFormatter(
     if (ts.getNanos == 0) {
       fastDateFormat.format(ts)
     } else {
-      format(fromJavaTimestamp(ts))
+      format(fromJavaTimestamp(zoneId.getId, ts))
     }
   }
 
@@ -468,7 +473,7 @@ class LegacySimpleTimestampFormatter(
   }
 
   override def parse(s: String): Long = {
-    fromJavaTimestamp(new Timestamp(sdf.parse(s).getTime))
+    fromJavaTimestamp(zoneId.getId, new Timestamp(sdf.parse(s).getTime))
   }
 
   override def parseOptional(s: String): Option[Long] = {
@@ -476,12 +481,12 @@ class LegacySimpleTimestampFormatter(
     if (date == null) {
       None
     } else {
-      Some(fromJavaTimestamp(new Timestamp(date.getTime)))
+      Some(fromJavaTimestamp(zoneId.getId, new Timestamp(date.getTime)))
     }
   }
 
   override def format(us: Long): String = {
-    sdf.format(toJavaTimestamp(us))
+    sdf.format(toJavaTimestamp(zoneId.getId, us))
   }
 
   override def format(ts: Timestamp): String = {

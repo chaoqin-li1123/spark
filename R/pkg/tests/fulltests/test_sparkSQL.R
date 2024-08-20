@@ -1474,6 +1474,8 @@ test_that("column functions", {
   c31 <- sec(c1) + csc(c1) + cot(c1)
   c32 <- ln(c1) + positive(c2) + negative(c3)
   c33 <- width_bucket(lit(2.5), lit(2.0), lit(3.0), lit(10L))
+  c34 <- collate(c, "UNICODE")
+  c35 <- collation(c)
 
   # Test if base::is.nan() is exposed
   expect_equal(is.nan(c("a", "b")), c(FALSE, FALSE))
@@ -4150,7 +4152,8 @@ test_that("catalog APIs, listTables, getTable, listColumns, listFunctions, funct
   c <- listColumns("cars")
   expect_equal(nrow(c), 2)
   expect_equal(colnames(c),
-               c("name", "description", "dataType", "nullable", "isPartition", "isBucket"))
+               c("name", "description", "dataType", "nullable", "isPartition", "isBucket",
+                 "isCluster"))
   expect_equal(collect(c)[[1]][[1]], "speed")
   expect_error(listColumns("zxwtyswklpf", "default"),
                "[TABLE_OR_VIEW_NOT_FOUND]*`spark_catalog`.`default`.`zxwtyswklpf`*")

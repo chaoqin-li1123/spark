@@ -71,6 +71,47 @@ WHERE  t1a IN (SELECT t2a
                LIMIT 10)
 LIMIT  2;
 
+-- correlated IN subquery
+-- LIMIT with OFFSET in parent side
+SELECT *
+FROM   t1
+WHERE  t1a IN (SELECT t2a
+               FROM   t2
+               WHERE  t1d = t2d)
+LIMIT  2
+OFFSET 1;
+
+-- correlated IN subquery
+-- LIMIT with OFFSET on both parent and subquery sides
+SELECT *
+FROM   t1
+WHERE  t1a IN (SELECT t2a
+               FROM   t2
+               WHERE  t1d = t2d
+               LIMIT 10
+               OFFSET 2)
+LIMIT  2
+OFFSET 1;
+
+-- correlated IN subquery
+-- OFFSET in parent side
+SELECT *
+FROM   t1
+WHERE  t1a IN (SELECT t2a
+               FROM   t2
+               WHERE  t1d = t2d)
+OFFSET 1;
+
+-- correlated IN subquery
+-- OFFSET on both parent and subquery sides
+SELECT *
+FROM   t1
+WHERE  t1a IN (SELECT t2a
+               FROM   t2
+               WHERE  t1d = t2d
+               OFFSET 2)
+OFFSET 1;
+
 -- TC 01.02
 SELECT *
 FROM   t1
@@ -308,6 +349,27 @@ GROUP  BY t1b
 ORDER BY t1b NULLS last
 OFFSET 1;
 
+-- SPARK-46526: LIMIT over correlated predicate that references only the outer table.
+SELECT COUNT(DISTINCT(t1a))
+FROM t1
+WHERE t1d IN (SELECT t2d
+              FROM   t2
+              WHERE t1a IS NOT NULL
+              LIMIT 10);
+
+SELECT COUNT(DISTINCT(t1a))
+FROM t1
+WHERE t1d IN (SELECT MAX(t2d)
+              FROM   t2
+              WHERE t1a IS NOT NULL
+              LIMIT 10);
+
+SELECT COUNT(DISTINCT(t1a))
+FROM t1
+WHERE t1d IN (SELECT DISTINCT t2d
+              FROM   t2
+              WHERE t1a IS NOT NULL
+              LIMIT 10);
 
 set spark.sql.optimizer.decorrelateExistsIn.enabled = false;
 -- LIMIT is not supported in correlated IN, unless the DECORRELATE_EXISTS_AND_IN_SUBQUERIES

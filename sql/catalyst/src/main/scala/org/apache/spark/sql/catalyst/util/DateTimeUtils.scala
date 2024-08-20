@@ -25,7 +25,7 @@ import java.util.concurrent.TimeUnit._
 
 import scala.util.control.NonFatal
 
-import org.apache.spark.{QueryContext, SparkException}
+import org.apache.spark.{QueryContext, SparkException, SparkIllegalArgumentException}
 import org.apache.spark.sql.catalyst.util.DateTimeConstants._
 import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.types.{Decimal, DoubleExactNumeric, TimestampNTZType, TimestampType}
@@ -375,7 +375,7 @@ object DateTimeUtils extends SparkDateTimeUtils {
   /**
    * Returns day of week from String. Starting from Thursday, marked as 0.
    * (Because 1970-01-01 is Thursday).
-   * @throws IllegalArgumentException if the input is not a valid day of week.
+   * @throws SparkIllegalArgumentException if the input is not a valid day of week.
    */
   def getDayOfWeekFromString(string: UTF8String): Int = {
     val dowString = string.toString.toUpperCase(Locale.ROOT)
@@ -388,7 +388,9 @@ object DateTimeUtils extends SparkDateTimeUtils {
       case "FR" | "FRI" | "FRIDAY" => FRIDAY
       case "SA" | "SAT" | "SATURDAY" => SATURDAY
       case _ =>
-        throw new IllegalArgumentException(s"""Illegal input for day of week: $string""")
+        throw new SparkIllegalArgumentException(
+          errorClass = "_LEGACY_ERROR_TEMP_3209",
+          messageParameters = Map("string" -> string.toString))
     }
   }
 
@@ -696,7 +698,7 @@ object DateTimeUtils extends SparkDateTimeUtils {
       }
     } catch {
       case _: scala.MatchError =>
-        throw SparkException.internalError(s"Got the unexpected unit '$unit'.")
+        throw QueryExecutionErrors.invalidDatetimeUnitError("TIMESTAMPADD", unit)
       case _: ArithmeticException | _: DateTimeException =>
         throw QueryExecutionErrors.timestampAddOverflowError(micros, quantity, unit)
       case e: Throwable =>
@@ -734,7 +736,7 @@ object DateTimeUtils extends SparkDateTimeUtils {
       val endLocalTs = getLocalDateTime(endTs, zoneId)
       timestampDiffMap(unitInUpperCase)(startLocalTs, endLocalTs)
     } else {
-      throw SparkException.internalError(s"Got the unexpected unit '$unit'.")
+      throw QueryExecutionErrors.invalidDatetimeUnitError("TIMESTAMPDIFF", unit)
     }
   }
 }

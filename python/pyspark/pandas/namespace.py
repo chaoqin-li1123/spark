@@ -94,9 +94,6 @@ from pyspark.pandas.spark.utils import as_nullable_spark_type, force_decimal_pre
 from pyspark.pandas.indexes import Index, DatetimeIndex, TimedeltaIndex
 from pyspark.pandas.indexes.multi import MultiIndex
 
-# For Supporting Spark Connect
-from pyspark.sql.utils import get_column_class
-
 __all__ = [
     "from_pandas",
     "range",
@@ -1803,7 +1800,7 @@ def date_range(
 
     Changed the `freq` (frequency) to ``'M'`` (month end frequency).
 
-    >>> ps.date_range(start='1/1/2018', periods=5, freq='M')  # doctest: +SKIP
+    >>> ps.date_range(start='1/1/2018', periods=5, freq='ME')  # doctest: +SKIP
     DatetimeIndex(['2018-01-31', '2018-02-28', '2018-03-31', '2018-04-30',
                    '2018-05-31'],
                   dtype='datetime64[ns]', freq=None)
@@ -2256,10 +2253,10 @@ def get_dummies(
             values = values[1:]
 
         def column_name(v: Any) -> Name:
-            if prefix is None or cast(List[str], prefix)[i] == "":
+            if prefix is None or prefix[i] == "":  # type: ignore[index]
                 return v
             else:
-                return "{}{}{}".format(cast(List[str], prefix)[i], prefix_sep, v)
+                return "{}{}{}".format(prefix[i], prefix_sep, v)  # type: ignore[index]
 
         for value in values:
             remaining_columns.append(
@@ -2554,7 +2551,10 @@ def concat(
         if isinstance(obj, Series):
             num_series += 1
             series_names.add(obj.name)
-            new_objs.append(obj.to_frame(DEFAULT_SERIES_NAME))
+            if not ignore_index and not should_return_series:
+                new_objs.append(obj.to_frame())
+            else:
+                new_objs.append(obj.to_frame(DEFAULT_SERIES_NAME))
         else:
             assert isinstance(obj, DataFrame)
             new_objs.append(obj)
@@ -2812,7 +2812,7 @@ def notna(obj):
     --------
     Show which entries in a DataFrame are not NA.
 
-    >>> df = ps.DataFrame({'age': [5, 6, np.NaN],
+    >>> df = ps.DataFrame({'age': [5, 6, np.nan],
     ...                    'born': [pd.NaT, pd.Timestamp('1939-05-27'),
     ...                             pd.Timestamp('1940-04-25')],
     ...                    'name': ['Alfred', 'Batman', ''],
@@ -2831,7 +2831,7 @@ def notna(obj):
 
     Show which entries in a Series are not NA.
 
-    >>> ser = ps.Series([5, 6, np.NaN])
+    >>> ser = ps.Series([5, 6, np.nan])
     >>> ser
     0    5.0
     1    6.0
@@ -3395,8 +3395,7 @@ def merge_asof(
     else:
         on = None
 
-    Column = get_column_class()
-    if tolerance is not None and not isinstance(tolerance, Column):
+    if tolerance is not None and not isinstance(tolerance, PySparkColumn):
         tolerance = F.lit(tolerance)
 
     as_of_joined_table = left_table._joinAsOf(
@@ -3421,10 +3420,10 @@ def merge_asof(
     data_columns = []
     column_labels = []
 
-    def left_scol_for(label: Label) -> Column:  # type: ignore[valid-type]
+    def left_scol_for(label: Label) -> PySparkColumn:
         return scol_for(as_of_joined_table, left_internal.spark_column_name_for(label))
 
-    def right_scol_for(label: Label) -> Column:  # type: ignore[valid-type]
+    def right_scol_for(label: Label) -> PySparkColumn:
         return scol_for(as_of_joined_table, right_internal.spark_column_name_for(label))
 
     for label in left_internal.column_labels:
@@ -3438,7 +3437,7 @@ def merge_asof(
                 pass
             else:
                 col = col + left_suffix
-                scol = scol.alias(col)  # type: ignore[attr-defined]
+                scol = scol.alias(col)
                 label = tuple([str(label[0]) + left_suffix] + list(label[1:]))
         exprs.append(scol)
         data_columns.append(col)
@@ -3446,7 +3445,7 @@ def merge_asof(
     for label in right_internal.column_labels:
         # recover `right_prefix` here.
         col = right_internal.spark_column_name_for(label)[len(right_prefix) :]
-        scol = right_scol_for(label).alias(col)  # type: ignore[attr-defined]
+        scol = right_scol_for(label).alias(col)
         if label in duplicate_columns:
             spark_column_name = left_internal.spark_column_name_for(label)
             if spark_column_name in left_as_of_names + left_join_on_names and (
@@ -3455,7 +3454,7 @@ def merge_asof(
                 continue
             else:
                 col = col + right_suffix
-                scol = scol.alias(col)  # type: ignore[attr-defined]
+                scol = scol.alias(col)
                 label = tuple([str(label[0]) + right_suffix] + list(label[1:]))
         exprs.append(scol)
         data_columns.append(col)
@@ -3732,8 +3731,15 @@ def _test() -> None:
     import uuid
     from pyspark.sql import SparkSession
     import pyspark.pandas.namespace
+    from pandas.util.version import Version
 
     os.chdir(os.environ["SPARK_HOME"])
+
+    if Version(np.__version__) >= Version("2"):
+        # Numpy 2.0+ changed its string format,
+        # adding type information to numeric scalars.
+        # `legacy="1.25"` only available in `nump>=2`
+        np.set_printoptions(legacy="1.25")  # type: ignore[arg-type]
 
     globs = pyspark.pandas.namespace.__dict__.copy()
     globs["ps"] = pyspark.pandas

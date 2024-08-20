@@ -17,19 +17,23 @@
 
 package org.apache.spark.deploy.rest
 
-import javax.servlet.http.{HttpServlet, HttpServletRequest, HttpServletResponse}
+import java.util.EnumSet
 
 import scala.io.Source
 
 import com.fasterxml.jackson.core.JsonProcessingException
+import jakarta.servlet.DispatcherType
+import jakarta.servlet.http.{HttpServlet, HttpServletRequest, HttpServletResponse}
 import org.eclipse.jetty.server.{HttpConnectionFactory, Server, ServerConnector}
-import org.eclipse.jetty.servlet.{ServletContextHandler, ServletHolder}
+import org.eclipse.jetty.servlet.{FilterHolder, ServletContextHandler, ServletHolder}
 import org.eclipse.jetty.util.thread.{QueuedThreadPool, ScheduledExecutorScheduler}
 import org.json4s._
 import org.json4s.jackson.JsonMethods._
 
 import org.apache.spark.{SPARK_VERSION => sparkVersion, SparkConf}
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys._
+import org.apache.spark.internal.config.MASTER_REST_SERVER_FILTERS
 import org.apache.spark.util.Utils
 
 /**
@@ -77,7 +81,8 @@ private[spark] abstract class RestSubmissionServer(
   def start(): Int = {
     val (server, boundPort) = Utils.startServiceOnPort[Server](requestedPort, doStart, masterConf)
     _server = Some(server)
-    logInfo(s"Started REST server for submitting applications on $host with port $boundPort")
+    logInfo(log"Started REST server for submitting applications on ${MDC(HOST, host)}" +
+      log" with port ${MDC(PORT, boundPort)}")
     boundPort
   }
 
@@ -110,10 +115,24 @@ private[spark] abstract class RestSubmissionServer(
     contextToServlet.foreach { case (prefix, servlet) =>
       mainHandler.addServlet(new ServletHolder(servlet), prefix)
     }
+    addFilters(mainHandler)
     server.setHandler(mainHandler)
     server.start()
     val boundPort = connector.getLocalPort
     (server, boundPort)
+  }
+
+  /**
+   * Add filters, if any, to the given ServletContextHandlers.
+   */
+  private def addFilters(handler: ServletContextHandler): Unit = {
+    masterConf.get(MASTER_REST_SERVER_FILTERS).foreach { filter =>
+      val params = masterConf.getAllWithPrefix(s"spark.$filter.param.").toMap
+      val holder = new FilterHolder()
+      holder.setClassName(filter)
+      params.foreach { case (k, v) => holder.setInitParameter(k, v) }
+      handler.addFilter(holder, "/*", EnumSet.allOf(classOf[DispatcherType]))
+    }
   }
 
   def stop(): Unit = {

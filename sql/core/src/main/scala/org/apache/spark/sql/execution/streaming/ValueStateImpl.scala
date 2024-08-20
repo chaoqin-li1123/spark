@@ -22,14 +22,15 @@ import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.execution.streaming.state.StateStore
 import org.apache.spark.sql.streaming.{SerializationType, StateEncoder, ValueState}
+import org.apache.spark.sql.execution.streaming.state.{NoPrefixKeyStateEncoderSpec, StateStore}
 
 /**
  * Class that provides a concrete implementation for a single value state associated with state
  * variables used in the streaming transformWithState operator.
  * @param store - reference to the StateStore instance to be used for storing state
  * @param stateName - name of logical state partition
- * @param keyEnc - Spark SQL encoder for key
- * @tparam K - data type of key
+ * @param keyExprEnc - Spark SQL encoder for key
+ * @param valEncoder - Spark SQL encoder for value
  * @tparam S - data type of object that will be stored
  */
 class ValueStateImpl[S](
@@ -40,14 +41,26 @@ class ValueStateImpl[S](
     serializer: SerializationType.Value) extends ValueState[S] with Logging {
 
   private val stateEncoder = new StateEncoder[S](valEnc)
+    valEncoder: Encoder[S])
+  extends ValueState[S] with Logging {
+
+  private val stateTypesEncoder = StateTypesEncoder(keyExprEnc, valEncoder, stateName)
+
+  initialize()
+
+  private def initialize(): Unit = {
+    store.createColFamilyIfAbsent(stateName, keyExprEnc.schema, valEncoder.schema,
+      NoPrefixKeyStateEncoderSpec(keyExprEnc.schema))
+  }
 
   /** Function to check if state exists. Returns true if present and false otherwise */
   override def exists(): Boolean = {
-    getImpl() != null
+    get() != null
   }
 
   /** Function to return Option of value if exists and None otherwise */
   override def getOption(): Option[S] = {
+
     val retRow = getImpl()
     if (retRow != null) {
       val resState = serializer match {
@@ -62,11 +75,14 @@ class ValueStateImpl[S](
     } else {
       None
     }
+    Option(get())
   }
 
   /** Function to return associated value with key if exists and null otherwise */
   override def get(): S = {
-    val retRow = getImpl()
+    val encodedGroupingKey = stateTypesEncoder.encodeGroupingKey()
+    val retRow = store.get(encodedGroupingKey, stateName)
+
     if (retRow != null) {
       val resState = serializer match {
         case SerializationType.AVRO =>
@@ -102,5 +118,15 @@ class ValueStateImpl[S](
   /** Function to remove state for given key */
   override def remove(): Unit = {
     store.remove(stateEncoder.encodeGroupingKey(stateName, keyExprEnc), stateName)
+  /** Function to update and overwrite state associated with given key */
+  override def update(newState: S): Unit = {
+    val encodedValue = stateTypesEncoder.encodeValue(newState)
+    store.put(stateTypesEncoder.encodeGroupingKey(),
+      encodedValue, stateName)
+  }
+
+  /** Function to remove state for given key */
+  override def clear(): Unit = {
+    store.remove(stateTypesEncoder.encodeGroupingKey(), stateName)
   }
 }

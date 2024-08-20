@@ -32,7 +32,7 @@ import org.scalatest.time.SpanSugar._
 
 import org.apache.spark.{SparkException, SparkThrowable}
 import org.apache.spark.connect.proto
-import org.apache.spark.connect.proto.{AddArtifactsRequest, AddArtifactsResponse, AnalyzePlanRequest, AnalyzePlanResponse, ArtifactStatusesRequest, ArtifactStatusesResponse, ExecutePlanRequest, ExecutePlanResponse, SparkConnectServiceGrpc}
+import org.apache.spark.connect.proto.{AddArtifactsRequest, AddArtifactsResponse, AnalyzePlanRequest, AnalyzePlanResponse, ArtifactStatusesRequest, ArtifactStatusesResponse, ExecutePlanRequest, ExecutePlanResponse, Relation, SparkConnectServiceGrpc, SQL}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.connect.common.config.ConnectCommon
 import org.apache.spark.sql.test.ConnectFunSuite
@@ -310,7 +310,14 @@ class SparkConnectClientSuite extends ConnectFunSuite with BeforeAndAfterEach {
         assert(client.userAgent.contains("scala/"))
         assert(client.userAgent.contains("jvm/"))
         assert(client.userAgent.contains("os/"))
-      }))
+      }),
+    TestPackURI(
+      "sc://SPARK-47694:123/;grpc_max_message_size=1860",
+      isCorrect = true,
+      client => {
+        assert(client.configuration.grpcMaxMessageSize == 1860)
+      }),
+    TestPackURI("sc://SPARK-47694:123/;grpc_max_message_size=abc", isCorrect = false))
 
   private def checkTestPack(testPack: TestPackURI): Unit = {
     val client = SparkConnectClient.builder().connectionString(testPack.connectionString).build()
@@ -478,6 +485,13 @@ class SparkConnectClientSuite extends ConnectFunSuite with BeforeAndAfterEach {
     session.addArtifact(artifactFilePath.resolve("smallClassFile.class").toString)
   }
 
+  private def buildPlan(query: String): proto.Plan = {
+    proto.Plan
+      .newBuilder()
+      .setRoot(Relation.newBuilder().setSql(SQL.newBuilder().setQuery(query)).build())
+      .build()
+  }
+
   test("SPARK-45871: Client execute iterator.toSeq consumes the reattachable iterator") {
     startDummyServer(0)
     client = SparkConnectClient
@@ -485,14 +499,9 @@ class SparkConnectClientSuite extends ConnectFunSuite with BeforeAndAfterEach {
       .connectionString(s"sc://localhost:${server.getPort}")
       .enableReattachableExecute()
       .build()
-    val session = SparkSession.builder().client(client).create()
-    val cmd = session.newCommand(b =>
-      b.setSqlCommand(
-        proto.SqlCommand
-          .newBuilder()
-          .setSql("select * from range(10000000)")))
-    val plan = proto.Plan.newBuilder().setCommand(cmd)
-    val iter = client.execute(plan.build())
+
+    val plan = buildPlan("select * from range(10000000)")
+    val iter = client.execute(plan)
     val reattachableIter =
       ExecutePlanResponseReattachableIterator.fromIterator(iter)
     iter.toSeq
@@ -512,17 +521,31 @@ class SparkConnectClientSuite extends ConnectFunSuite with BeforeAndAfterEach {
       .connectionString(s"sc://localhost:${server.getPort}")
       .enableReattachableExecute()
       .build()
-    val session = SparkSession.builder().client(client).create()
-    val cmd = session.newCommand(b =>
-      b.setSqlCommand(
-        proto.SqlCommand
-          .newBuilder()
-          .setSql("select * from range(10000000)")))
-    val plan = proto.Plan.newBuilder().setCommand(cmd)
-    val iter = client.execute(plan.build())
+
+    val plan = buildPlan("select * from range(10000000)")
+    val iter = client.execute(plan)
     val reattachableIter =
       ExecutePlanResponseReattachableIterator.fromIterator(iter)
     iter.foreach(_ => ())
+    assert(reattachableIter.resultComplete)
+  }
+
+  test("SPARK-48056: Client execute gets INVALID_HANDLE.SESSION_NOT_FOUND and proceeds") {
+    startDummyServer(0)
+    client = SparkConnectClient
+      .builder()
+      .connectionString(s"sc://localhost:${server.getPort}")
+      .enableReattachableExecute()
+      .build()
+    service.errorToThrowOnExecute = Some(
+      new StatusRuntimeException(
+        Status.INTERNAL.withDescription("INVALID_HANDLE.SESSION_NOT_FOUND")))
+
+    val plan = buildPlan("select * from range(1)")
+    val iter = client.execute(plan)
+    val reattachableIter =
+      ExecutePlanResponseReattachableIterator.fromIterator(iter)
+    reattachableIter.foreach(_ => ())
     assert(reattachableIter.resultComplete)
   }
 
@@ -605,6 +628,8 @@ class DummySparkConnectService() extends SparkConnectServiceGrpc.SparkConnectSer
   private val inputArtifactRequests: mutable.ListBuffer[AddArtifactsRequest] =
     mutable.ListBuffer.empty
 
+  var errorToThrowOnExecute: Option[Throwable] = None
+
   private[sql] def getAndClearLatestInputPlan(): proto.Plan = {
     val plan = inputPlan
     inputPlan = null
@@ -620,6 +645,13 @@ class DummySparkConnectService() extends SparkConnectServiceGrpc.SparkConnectSer
   override def executePlan(
       request: ExecutePlanRequest,
       responseObserver: StreamObserver[ExecutePlanResponse]): Unit = {
+    if (errorToThrowOnExecute.isDefined) {
+      val error = errorToThrowOnExecute.get
+      errorToThrowOnExecute = None
+      responseObserver.onError(error)
+      return
+    }
+
     // Reply with a dummy response using the same client ID
     val requestSessionId = request.getSessionId
     val operationId = if (request.hasOperationId) {

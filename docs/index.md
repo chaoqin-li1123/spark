@@ -38,8 +38,6 @@ Spark runs on Java 17/21, Scala 2.13, Python 3.8+, and R 3.5+.
 When using the Scala API, it is necessary for applications to use the same version of Scala that Spark was compiled for.
 For example, when using Scala 2.13, use Spark compiled for 2.13, and compile code/applications for Scala 2.13 as well.
 
-Setting `-Dio.netty.tryReflectionSetAccessible=true` is required for the Apache Arrow library. This prevents the `java.lang.UnsupportedOperationException: sun.misc.Unsafe or java.nio.DirectByteBuffer.(long, int) not available` error when Apache Arrow uses Netty internally.
-
 # Running the Examples and Shell
 
 Spark comes with several sample programs. Python, Scala, Java, and R examples are in the
@@ -120,6 +118,7 @@ options for deployment:
 
 * [Spark Python API (Sphinx)](api/python/index.html)
 * [Spark Scala API (Scaladoc)](api/scala/org/apache/spark/index.html)
+* [Spark Connect Scala Client API (Scaladoc)](api/connect/scala/org/apache/spark/index.html)
 * [Spark Java API (Javadoc)](api/java/index.html)
 * [Spark R API (Roxygen2)](api/R/index.html)
 * [Spark SQL, Built-in Functions (MkDocs)](api/sql/index.html)
@@ -138,6 +137,7 @@ options for deployment:
 
 * [Configuration](configuration.html): customize Spark via its configuration system
 * [Monitoring](monitoring.html): track the behavior of your applications
+* [Web UI](web-ui.html): view useful information about your applications
 * [Tuning Guide](tuning.html): best practices to optimize performance and memory use
 * [Job Scheduling](job-scheduling.html): scheduling resources across and within Spark applications
 * [Security](security.html): Spark security support
@@ -145,7 +145,7 @@ options for deployment:
 * Integration with other storage systems:
   * [Cloud Infrastructures](cloud-integration.html)
   * [OpenStack Swift](storage-openstack-swift.html)
-* [Migration Guide](migration-guide.html): Migration guides for Spark components
+* [Migration Guide](migration-guide.html): migration guides for Spark components
 * [Building Spark](building-spark.html): build Spark using the Maven system
 * [Contributing to Spark](https://spark.apache.org/contributing.html)
 * [Third Party Projects](https://spark.apache.org/third-party-projects.html): related third party Spark projects

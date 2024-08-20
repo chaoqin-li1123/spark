@@ -22,12 +22,11 @@ import java.util.Comparator
 import scala.collection.mutable
 import scala.reflect.ClassTag
 
-import org.apache.spark.{QueryContext, SparkException}
+import org.apache.spark.{QueryContext, SparkException, SparkIllegalArgumentException}
 import org.apache.spark.SparkException.internalError
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.{TypeCheckResult, TypeCoercion, UnresolvedAttribute, UnresolvedSeed}
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.DataTypeMismatch
-import org.apache.spark.sql.catalyst.expressions.ArraySortLike.NullOrder
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.trees.{BinaryLike, UnaryLike}
@@ -38,6 +37,7 @@ import org.apache.spark.sql.catalyst.util.DateTimeConstants._
 import org.apache.spark.sql.catalyst.util.DateTimeUtils._
 import org.apache.spark.sql.errors.{QueryErrorsBase, QueryExecutionErrors}
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.types.{AbstractArrayType, StringTypeAnyCollation}
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.util.SQLOpenHashSet
 import org.apache.spark.unsafe.UTF8StringBuilder
@@ -95,9 +95,9 @@ trait BinaryArrayExpressionWithImplicitCast
 @ExpressionDescription(
   usage = """
     _FUNC_(expr) - Returns the size of an array or a map.
-    The function returns null for null input if spark.sql.legacy.sizeOfNull is set to false or
-    spark.sql.ansi.enabled is set to true. Otherwise, the function returns -1 for null input.
-    With the default settings, the function returns -1 for null input.
+    This function returns -1 for null input only if spark.sql.ansi.enabled is false and
+    spark.sql.legacy.sizeOfNull is true. Otherwise, it returns null for null input.
+    With the default settings, the function returns null for null input.
   """,
   examples = """
     Examples:
@@ -302,8 +302,7 @@ case class ArraysZip(children: Seq[Expression], names: Seq[Expression])
   }
 
   if (children.size != names.size) {
-    throw new IllegalArgumentException(
-      "The numbers of zipped arrays and field names should be the same")
+    throw new SparkIllegalArgumentException("_LEGACY_ERROR_TEMP_3235")
   }
 
   final override val nodePatterns: Seq[TreePattern] = Seq(ARRAYS_ZIP)
@@ -713,6 +712,7 @@ case class MapConcat(children: Seq[Expression])
     }
   }
 
+  override def stateful: Boolean = true
   override def nullable: Boolean = children.exists(_.nullable)
 
   private lazy val mapBuilder = new ArrayBasedMapBuilder(dataType.keyType, dataType.valueType)
@@ -828,6 +828,8 @@ case class MapFromEntries(child: Expression)
 
   override def nullable: Boolean = child.nullable || nullEntries
 
+  override def stateful: Boolean = true
+
   @transient override lazy val dataType: MapType = dataTypeDetails.get._1
 
   override def checkInputDataTypes(): TypeCheckResult = dataTypeDetails match {
@@ -837,7 +839,7 @@ case class MapFromEntries(child: Expression)
       DataTypeMismatch(
         errorSubClass = "UNEXPECTED_INPUT_TYPE",
         messageParameters = Map(
-          "paramIndex" -> "1",
+          "paramIndex" -> ordinalNumber(0),
           "requiredType" -> s"${toSQLType(ArrayType)} of pair ${toSQLType(StructType)}",
           "inputSql" -> toSQLExpr(child),
           "inputType" -> toSQLType(child.dataType)
@@ -889,17 +891,206 @@ case class MapFromEntries(child: Expression)
     copy(child = newChild)
 }
 
+case class MapSort(base: Expression)
+  extends UnaryExpression with NullIntolerant with QueryErrorsBase {
+
+  val keyType: DataType = base.dataType.asInstanceOf[MapType].keyType
+  val valueType: DataType = base.dataType.asInstanceOf[MapType].valueType
+
+  override def child: Expression = base
+
+  override def dataType: DataType = base.dataType
+
+  override def checkInputDataTypes(): TypeCheckResult = base.dataType match {
+    case m: MapType if RowOrdering.isOrderable(m.keyType) =>
+        TypeCheckResult.TypeCheckSuccess
+    case _: MapType =>
+      DataTypeMismatch(
+        errorSubClass = "INVALID_ORDERING_TYPE",
+        messageParameters = Map(
+          "functionName" -> toSQLId(prettyName),
+          "dataType" -> toSQLType(base.dataType)
+        )
+      )
+    case _ =>
+      DataTypeMismatch(
+        errorSubClass = "UNEXPECTED_INPUT_TYPE",
+        messageParameters = Map(
+          "paramIndex" -> ordinalNumber(0),
+          "requiredType" -> toSQLType(MapType),
+          "inputSql" -> toSQLExpr(base),
+          "inputType" -> toSQLType(base.dataType))
+      )
+  }
+
+  override def nullSafeEval(array: Any): Any = {
+    // put keys and their respective values inside a tuple and sort them
+    // according to the key ordering. Extract the new sorted k/v pairs to form a sorted map
+
+    val mapData = array.asInstanceOf[MapData]
+    val numElements = mapData.numElements()
+    val keys = mapData.keyArray()
+    val values = mapData.valueArray()
+
+    val ordering = PhysicalDataType.ordering(keyType)
+
+    val sortedMap = Array
+      .tabulate(numElements)(i => (keys.get(i, keyType).asInstanceOf[Any],
+        values.get(i, valueType).asInstanceOf[Any]))
+      .sortBy(_._1)(ordering)
+
+    new ArrayBasedMapData(new GenericArrayData(sortedMap.map(_._1)),
+      new GenericArrayData(sortedMap.map(_._2)))
+  }
+
+  override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
+    nullSafeCodeGen(ctx, ev, b => sortCodegen(ctx, ev, b))
+  }
+
+  private def sortCodegen(ctx: CodegenContext, ev: ExprCode,
+      base: String): String = {
+
+    val arrayBasedMapData = classOf[ArrayBasedMapData].getName
+    val genericArrayData = classOf[GenericArrayData].getName
+
+    val numElements = ctx.freshName("numElements")
+    val keys = ctx.freshName("keys")
+    val values = ctx.freshName("values")
+    val sortArray = ctx.freshName("sortArray")
+    val i = ctx.freshName("i")
+    val o1 = ctx.freshName("o1")
+    val o1entry = ctx.freshName("o1entry")
+    val o2 = ctx.freshName("o2")
+    val o2entry = ctx.freshName("o2entry")
+    val c = ctx.freshName("c")
+    val newKeys = ctx.freshName("newKeys")
+    val newValues = ctx.freshName("newValues")
+
+    val boxedKeyType = CodeGenerator.boxedType(keyType)
+    val boxedValueType = CodeGenerator.boxedType(valueType)
+    val javaKeyType = CodeGenerator.javaType(keyType)
+
+    val simpleEntryType = s"java.util.AbstractMap.SimpleEntry<$boxedKeyType, $boxedValueType>"
+
+    val comp = if (CodeGenerator.isPrimitiveType(keyType)) {
+      val v1 = ctx.freshName("v1")
+      val v2 = ctx.freshName("v2")
+      s"""
+         |$javaKeyType $v1 = (($boxedKeyType) $o1).${javaKeyType}Value();
+         |$javaKeyType $v2 = (($boxedKeyType) $o2).${javaKeyType}Value();
+         |int $c = ${ctx.genComp(keyType, v1, v2)};
+       """.stripMargin
+    } else {
+      s"int $c = ${ctx.genComp(keyType, s"(($javaKeyType) $o1)", s"(($javaKeyType) $o2)")};"
+    }
+
+    s"""
+       |final int $numElements = $base.numElements();
+       |ArrayData $keys = $base.keyArray();
+       |ArrayData $values = $base.valueArray();
+       |
+       |Object[] $sortArray = new Object[$numElements];
+       |
+       |for (int $i = 0; $i < $numElements; $i++) {
+       |  $sortArray[$i] = new $simpleEntryType(
+       |    ${CodeGenerator.getValue(keys, keyType, i)},
+       |    ${CodeGenerator.getValue(values, valueType, i)});
+       |}
+       |
+       |java.util.Arrays.sort($sortArray, new java.util.Comparator<Object>() {
+       |  @Override public int compare(Object $o1entry, Object $o2entry) {
+       |    Object $o1 = (($simpleEntryType) $o1entry).getKey();
+       |    Object $o2 = (($simpleEntryType) $o2entry).getKey();
+       |    $comp;
+       |    return $c;
+       |  }
+       |});
+       |
+       |Object[] $newKeys = new Object[$numElements];
+       |Object[] $newValues = new Object[$numElements];
+       |
+       |for (int $i = 0; $i < $numElements; $i++) {
+       |  $newKeys[$i] = (($simpleEntryType) $sortArray[$i]).getKey();
+       |  $newValues[$i] = (($simpleEntryType) $sortArray[$i]).getValue();
+       |}
+       |
+       |${ev.value} = new $arrayBasedMapData(
+       |  new $genericArrayData($newKeys), new $genericArrayData($newValues));
+       |""".stripMargin
+  }
+
+  override protected def withNewChildInternal(newChild: Expression)
+    : MapSort = copy(base = newChild)
+}
 
 /**
- * Common base class for [[SortArray]] and [[ArraySort]].
+ * Sorts the input array in ascending / descending order according to the natural ordering of
+ * the array elements and returns it.
  */
-trait ArraySortLike extends ExpectsInputTypes {
-  protected def arrayExpression: Expression
+// scalastyle:off line.size.limit
+@ExpressionDescription(
+  usage = """
+    _FUNC_(array[, ascendingOrder]) - Sorts the input array in ascending or descending order
+      according to the natural ordering of the array elements. NaN is greater than any non-NaN
+      elements for double/float type. Null elements will be placed at the beginning of the returned
+      array in ascending order or at the end of the returned array in descending order.
+  """,
+  examples = """
+    Examples:
+      > SELECT _FUNC_(array('b', 'd', null, 'c', 'a'), true);
+       [null,"a","b","c","d"]
+      > SELECT _FUNC_(array('b', 'd', null, 'c', 'a'), false);
+       ["d","c","b","a",null]
+  """,
+  group = "array_funcs",
+  since = "1.5.0")
+// scalastyle:on line.size.limit
+case class SortArray(base: Expression, ascendingOrder: Expression)
+  extends BinaryExpression with ExpectsInputTypes with NullIntolerant with QueryErrorsBase {
 
-  protected def nullOrder: NullOrder
+  def this(e: Expression) = this(e, Literal(true))
+
+  override def left: Expression = base
+  override def right: Expression = ascendingOrder
+  override def dataType: DataType = base.dataType
+  override def inputTypes: Seq[AbstractDataType] = Seq(ArrayType, BooleanType)
+
+  override def checkInputDataTypes(): TypeCheckResult = base.dataType match {
+    case ArrayType(dt, _) if RowOrdering.isOrderable(dt) =>
+      ascendingOrder match {
+        case Literal(_: Boolean, BooleanType) =>
+          TypeCheckResult.TypeCheckSuccess
+        case _ =>
+          DataTypeMismatch(
+            errorSubClass = "UNEXPECTED_INPUT_TYPE",
+            messageParameters = Map(
+              "paramIndex" -> ordinalNumber(1),
+              "requiredType" -> toSQLType(BooleanType),
+              "inputSql" -> toSQLExpr(ascendingOrder),
+              "inputType" -> toSQLType(ascendingOrder.dataType))
+          )
+      }
+    case ArrayType(dt, _) =>
+      DataTypeMismatch(
+        errorSubClass = "INVALID_ORDERING_TYPE",
+        messageParameters = Map(
+          "functionName" -> toSQLId(prettyName),
+          "dataType" -> toSQLType(base.dataType)
+        )
+      )
+    case _ =>
+      DataTypeMismatch(
+        errorSubClass = "UNEXPECTED_INPUT_TYPE",
+        messageParameters = Map(
+          "paramIndex" -> ordinalNumber(0),
+          "requiredType" -> toSQLType(ArrayType),
+          "inputSql" -> toSQLExpr(base),
+          "inputType" -> toSQLType(base.dataType))
+      )
+  }
 
   @transient private lazy val lt: Comparator[Any] = {
-    val ordering = arrayExpression.dataType match {
+    val ordering = base.dataType match {
       case _ @ ArrayType(n, _) =>
         PhysicalDataType.ordering(n)
     }
@@ -907,9 +1098,9 @@ trait ArraySortLike extends ExpectsInputTypes {
       if (o1 == null && o2 == null) {
         0
       } else if (o1 == null) {
-        nullOrder
+        -1
       } else if (o2 == null) {
-        -nullOrder
+        1
       } else {
         ordering.compare(o1, o2)
       }
@@ -917,7 +1108,7 @@ trait ArraySortLike extends ExpectsInputTypes {
   }
 
   @transient private lazy val gt: Comparator[Any] = {
-    val ordering = arrayExpression.dataType match {
+    val ordering = base.dataType match {
       case _ @ ArrayType(n, _) =>
         PhysicalDataType.ordering(n)
     }
@@ -926,9 +1117,9 @@ trait ArraySortLike extends ExpectsInputTypes {
       if (o1 == null && o2 == null) {
         0
       } else if (o1 == null) {
-        -nullOrder
+        1
       } else if (o2 == null) {
-        nullOrder
+        -1
       } else {
         ordering.compare(o2, o1)
       }
@@ -936,12 +1127,12 @@ trait ArraySortLike extends ExpectsInputTypes {
   }
 
   @transient lazy val elementType: DataType =
-    arrayExpression.dataType.asInstanceOf[ArrayType].elementType
+    base.dataType.asInstanceOf[ArrayType].elementType
 
   private def resultArrayElementNullable: Boolean =
-    arrayExpression.dataType.asInstanceOf[ArrayType].containsNull
+    base.dataType.asInstanceOf[ArrayType].containsNull
 
-  def sortEval(array: Any, ascending: Boolean): Any = {
+  private def sortEval(array: Any, ascending: Boolean): Any = {
     val data = array.asInstanceOf[ArrayData].toArray[AnyRef](elementType)
     if (elementType != NullType) {
       java.util.Arrays.sort(data, if (ascending) lt else gt)
@@ -949,7 +1140,11 @@ trait ArraySortLike extends ExpectsInputTypes {
     new GenericArrayData(data.asInstanceOf[Array[Any]])
   }
 
-  def sortCodegen(ctx: CodegenContext, ev: ExprCode, base: String, order: String): String = {
+  private def sortCodegen(
+      ctx: CodegenContext,
+      ev: ExprCode,
+      base: String,
+      order: String): String = {
     val genericArrayData = classOf[GenericArrayData].getName
     val unsafeArrayData = classOf[UnsafeArrayData].getName
     val array = ctx.freshName("array")
@@ -977,18 +1172,18 @@ trait ArraySortLike extends ExpectsInputTypes {
       val canPerformFastSort = CodeGenerator.isPrimitiveType(elementType) &&
         elementType != BooleanType && !resultArrayElementNullable
       val nonNullPrimitiveAscendingSort = if (canPerformFastSort) {
-          val javaType = CodeGenerator.javaType(elementType)
-          val primitiveTypeName = CodeGenerator.primitiveTypeName(elementType)
-          s"""
-             |if ($order) {
-             |  $javaType[] $array = $base.to${primitiveTypeName}Array();
-             |  java.util.Arrays.sort($array);
-             |  ${ev.value} = $unsafeArrayData.fromPrimitiveArray($array);
-             |} else
+        val javaType = CodeGenerator.javaType(elementType)
+        val primitiveTypeName = CodeGenerator.primitiveTypeName(elementType)
+        s"""
+           |if ($order) {
+           |  $javaType[] $array = $base.to${primitiveTypeName}Array();
+           |  java.util.Arrays.sort($array);
+           |  ${ev.value} = $unsafeArrayData.fromPrimitiveArray($array);
+           |} else
            """.stripMargin
-        } else {
-          ""
-        }
+      } else {
+        ""
+      }
       s"""
          |$nonNullPrimitiveAscendingSort
          |{
@@ -999,9 +1194,9 @@ trait ArraySortLike extends ExpectsInputTypes {
          |      if ($o1 == null && $o2 == null) {
          |        return 0;
          |      } else if ($o1 == null) {
-         |        return $sortOrder * $nullOrder;
+         |        return -$sortOrder;
          |      } else if ($o2 == null) {
-         |        return -$sortOrder * $nullOrder;
+         |        return $sortOrder;
          |      }
          |      $comp
          |      return $sortOrder * $c;
@@ -1011,85 +1206,6 @@ trait ArraySortLike extends ExpectsInputTypes {
          |}
        """.stripMargin
     }
-  }
-
-}
-
-object ArraySortLike {
-  type NullOrder = Int
-  // Least: place null element at the first of the array for ascending order
-  // Greatest: place null element at the end of the array for ascending order
-  object NullOrder {
-    val Least: NullOrder = -1
-    val Greatest: NullOrder = 1
-  }
-}
-
-/**
- * Sorts the input array in ascending / descending order according to the natural ordering of
- * the array elements and returns it.
- */
-// scalastyle:off line.size.limit
-@ExpressionDescription(
-  usage = """
-    _FUNC_(array[, ascendingOrder]) - Sorts the input array in ascending or descending order
-      according to the natural ordering of the array elements. NaN is greater than any non-NaN
-      elements for double/float type. Null elements will be placed at the beginning of the returned
-      array in ascending order or at the end of the returned array in descending order.
-  """,
-  examples = """
-    Examples:
-      > SELECT _FUNC_(array('b', 'd', null, 'c', 'a'), true);
-       [null,"a","b","c","d"]
-  """,
-  group = "array_funcs",
-  since = "1.5.0")
-// scalastyle:on line.size.limit
-case class SortArray(base: Expression, ascendingOrder: Expression)
-  extends BinaryExpression with ArraySortLike with NullIntolerant with QueryErrorsBase {
-
-  def this(e: Expression) = this(e, Literal(true))
-
-  override def left: Expression = base
-  override def right: Expression = ascendingOrder
-  override def dataType: DataType = base.dataType
-  override def inputTypes: Seq[AbstractDataType] = Seq(ArrayType, BooleanType)
-
-  override def arrayExpression: Expression = base
-  override def nullOrder: NullOrder = NullOrder.Least
-
-  override def checkInputDataTypes(): TypeCheckResult = base.dataType match {
-    case ArrayType(dt, _) if RowOrdering.isOrderable(dt) =>
-      ascendingOrder match {
-        case Literal(_: Boolean, BooleanType) =>
-          TypeCheckResult.TypeCheckSuccess
-        case _ =>
-          DataTypeMismatch(
-            errorSubClass = "UNEXPECTED_INPUT_TYPE",
-            messageParameters = Map(
-              "paramIndex" -> "2",
-              "requiredType" -> toSQLType(BooleanType),
-              "inputSql" -> toSQLExpr(ascendingOrder),
-              "inputType" -> toSQLType(ascendingOrder.dataType))
-          )
-      }
-    case ArrayType(dt, _) =>
-      DataTypeMismatch(
-        errorSubClass = "INVALID_ORDERING_TYPE",
-        messageParameters = Map(
-          "functionName" -> toSQLId(prettyName),
-          "dataType" -> toSQLType(base.dataType)
-        )
-      )
-    case _ =>
-      DataTypeMismatch(
-        errorSubClass = "UNEXPECTED_INPUT_TYPE",
-        messageParameters = Map(
-          "paramIndex" -> "1",
-          "requiredType" -> toSQLType(ArrayType),
-          "inputSql" -> toSQLExpr(base),
-          "inputType" -> toSQLType(base.dataType))
-      )
   }
 
   override def nullSafeEval(array: Any, ascending: Any): Any = {
@@ -1128,6 +1244,9 @@ case class Shuffle(child: Expression, randomSeed: Option[Long] = None) extends U
   with ExpectsInputTypes with Nondeterministic with ExpressionWithRandomSeed {
 
   def this(child: Expression) = this(child, None)
+
+  def this(child: Expression, seed: Expression) =
+    this(child, ExpressionWithRandomSeed.expressionToSeed(seed, "shuffle"))
 
   override def stateful: Boolean = true
 
@@ -1221,7 +1340,8 @@ case class Reverse(child: Expression)
   extends UnaryExpression with ImplicitCastInputTypes with NullIntolerant {
 
   // Input types are utilized by type coercion in ImplicitTypeCasts.
-  override def inputTypes: Seq[AbstractDataType] = Seq(TypeCollection(StringType, ArrayType))
+  override def inputTypes: Seq[AbstractDataType] =
+    Seq(TypeCollection(StringTypeAnyCollation, ArrayType))
 
   override def dataType: DataType = child.dataType
 
@@ -1235,7 +1355,7 @@ case class Reverse(child: Expression)
         val arrayData = input.asInstanceOf[ArrayData]
         new GenericArrayData(arrayData.toObjectArray(elementType).reverse)
       }
-    case StringType => _.asInstanceOf[UTF8String].reverse()
+    case _: StringType => _.asInstanceOf[UTF8String].reverse()
   }
 
   override def doGenCode(ctx: CodegenContext, ev: ExprCode): ExprCode = {
@@ -1321,7 +1441,7 @@ case class ArrayContains(left: Expression, right: Expression)
         DataTypeMismatch(
           errorSubClass = "UNEXPECTED_INPUT_TYPE",
           messageParameters = Map(
-            "paramIndex" -> "1",
+            "paramIndex" -> ordinalNumber(0),
             "requiredType" -> toSQLType(ArrayType),
             "inputSql" -> toSQLExpr(left),
             "inputType" -> toSQLType(left.dataType))
@@ -1428,7 +1548,7 @@ trait ArrayPendBase extends RuntimeReplaceable
         DataTypeMismatch(
           errorSubClass = "UNEXPECTED_INPUT_TYPE",
           messageParameters = Map(
-            "paramIndex" -> "0",
+            "paramIndex" -> ordinalNumber(0),
             "requiredType" -> toSQLType(ArrayType),
             "inputSql" -> toSQLExpr(left),
             "inputType" -> toSQLType(left.dataType)
@@ -1872,9 +1992,9 @@ case class ArrayJoin(
     this(array, delimiter, Some(nullReplacement))
 
   override def inputTypes: Seq[AbstractDataType] = if (nullReplacement.isDefined) {
-    Seq(ArrayType(StringType), StringType, StringType)
+    Seq(AbstractArrayType(StringTypeAnyCollation), StringTypeAnyCollation, StringTypeAnyCollation)
   } else {
-    Seq(ArrayType(StringType), StringType)
+    Seq(AbstractArrayType(StringTypeAnyCollation), StringTypeAnyCollation)
   }
 
   override def children: Seq[Expression] = if (nullReplacement.isDefined) {
@@ -2019,7 +2139,7 @@ case class ArrayJoin(
     }
   }
 
-  override def dataType: DataType = StringType
+  override def dataType: DataType = array.dataType.asInstanceOf[ArrayType].elementType
 
   override def prettyName: String = "array_join"
 }
@@ -2222,7 +2342,7 @@ case class ArrayPosition(left: Expression, right: Expression)
         DataTypeMismatch(
           errorSubClass = "UNEXPECTED_INPUT_TYPE",
           messageParameters = Map(
-            "paramIndex" -> "1",
+            "paramIndex" -> ordinalNumber(0),
             "requiredType" -> toSQLType(ArrayType),
             "inputSql" -> toSQLExpr(left),
             "inputType" -> toSQLType(left.dataType))
@@ -2382,7 +2502,7 @@ case class ElementAt(
         DataTypeMismatch(
           errorSubClass = "UNEXPECTED_INPUT_TYPE",
           messageParameters = Map(
-            "paramIndex" -> "2",
+            "paramIndex" -> ordinalNumber(1),
             "requiredType" -> toSQLType(IntegerType),
             "inputSql" -> toSQLExpr(right),
             "inputType" -> toSQLType(right.dataType))
@@ -2401,7 +2521,7 @@ case class ElementAt(
         DataTypeMismatch(
           errorSubClass = "UNEXPECTED_INPUT_TYPE",
           messageParameters = Map(
-            "paramIndex" -> "1",
+            "paramIndex" -> ordinalNumber(0),
             "requiredType" -> toSQLType(TypeCollection(ArrayType, MapType)),
             "inputSql" -> toSQLExpr(left),
             "inputType" -> toSQLType(left.dataType))
@@ -2594,7 +2714,8 @@ case class TryElementAt(left: Expression, right: Expression, replacement: Expres
 case class Concat(children: Seq[Expression]) extends ComplexTypeMergingExpression
   with QueryErrorsBase {
 
-  private def allowedTypes: Seq[AbstractDataType] = Seq(StringType, BinaryType, ArrayType)
+  private def allowedTypes: Seq[AbstractDataType] =
+    Seq(StringTypeAnyCollation, BinaryType, ArrayType)
 
   final override val nodePatterns: Seq[TreePattern] = Seq(CONCAT)
 
@@ -2607,7 +2728,7 @@ case class Concat(children: Seq[Expression]) extends ComplexTypeMergingExpressio
           DataTypeMismatch(
             errorSubClass = "UNEXPECTED_INPUT_TYPE",
             messageParameters = Map(
-              "paramIndex" -> (idx + 1).toString,
+              "paramIndex" -> ordinalNumber(idx),
               "requiredType" -> toSQLType(TypeCollection(allowedTypes: _*)),
               "inputSql" -> toSQLExpr(e),
               "inputType" -> toSQLType(e.dataType))
@@ -2644,7 +2765,7 @@ case class Concat(children: Seq[Expression]) extends ComplexTypeMergingExpressio
         val inputs = children.map(_.eval(input).asInstanceOf[Array[Byte]])
         ByteArray.concat(inputs: _*)
       }
-    case StringType =>
+    case _: StringType =>
       input => {
         val inputs = children.map(_.eval(input).asInstanceOf[UTF8String])
         UTF8String.concat(inputs: _*)
@@ -2715,7 +2836,7 @@ case class Concat(children: Seq[Expression]) extends ComplexTypeMergingExpressio
     val (concat, initCode) = dataType match {
       case BinaryType =>
         (s"${classOf[ByteArray].getName}.concat", s"byte[][] $args = new byte[${evals.length}][];")
-      case StringType =>
+      case _: StringType =>
         ("UTF8String.concat", s"UTF8String[] $args = new UTF8String[${evals.length}];")
       case ArrayType(elementType, containsNull) =>
         val concat = genCodeForArrays(ctx, elementType, containsNull)
@@ -2824,7 +2945,7 @@ case class Flatten(child: Expression) extends UnaryExpression with NullIntoleran
       DataTypeMismatch(
         errorSubClass = "UNEXPECTED_INPUT_TYPE",
         messageParameters = Map(
-          "paramIndex" -> "1",
+          "paramIndex" -> ordinalNumber(0),
           "requiredType" -> s"${toSQLType(ArrayType)} of ${toSQLType(ArrayType)}",
           "inputSql" -> toSQLExpr(child),
           "inputType" -> toSQLType(child.dataType))
@@ -3353,8 +3474,9 @@ object Sequence {
       val (stepMonths, stepDays, stepMicros) = splitStep(input3)
 
       if (scale == MICROS_PER_DAY && stepMonths == 0 && stepDays == 0) {
-        throw new IllegalArgumentException(s"sequence step must be an ${intervalType.typeName}" +
-          " of day granularity if start and end values are dates")
+        throw new SparkIllegalArgumentException(
+          errorClass = "_LEGACY_ERROR_TEMP_3242",
+          messageParameters = Map("intervalType" -> intervalType.typeName))
       }
 
       if (stepMonths == 0 && stepMicros == 0 && scale == MICROS_PER_DAY) {
@@ -3446,9 +3568,10 @@ object Sequence {
       val check = if (scale == MICROS_PER_DAY) {
         s"""
            |if ($stepMonths == 0 && $stepDays == 0) {
-           |  throw new IllegalArgumentException(
-           |    "sequence step must be an ${intervalType.typeName} " +
-           |    "of day granularity if start and end values are dates");
+           |  java.util.Map<String, String> params = new java.util.HashMap<String, String>();
+           |  params.put("intervalType", "${intervalType.typeName}");
+           |  throw new org.apache.spark.SparkIllegalArgumentException(
+           |    "_LEGACY_ERROR_TEMP_3242", params);
            |}
          """.stripMargin
         } else {
@@ -3539,8 +3662,12 @@ object Sequence {
        |if (!(($estimatedStep > 0 && $start <= $stop) ||
        |  ($estimatedStep < 0 && $start >= $stop) ||
        |  ($estimatedStep == 0 && $start == $stop))) {
-       |  throw new IllegalArgumentException(
-       |    "Illegal sequence boundaries: " + $start + " to " + $stop + " by " + $step);
+       |  java.util.Map<String, String> params = new java.util.HashMap<String, String>();
+       |  params.put("start", $start);
+       |  params.put("stop", $stop);
+       |  params.put("step", $step);
+       |  throw new org.apache.spark.SparkIllegalArgumentException(
+       |    "_LEGACY_ERROR_TEMP_3243", params);
        |}
        |int $len = $calcFn((long) $start, (long) $stop, (long) $estimatedStep);
        """.stripMargin
@@ -4742,7 +4869,7 @@ case class ArrayInsert(
         DataTypeMismatch(
           errorSubClass = "UNEXPECTED_INPUT_TYPE",
           messageParameters = Map(
-            "paramIndex" -> "2",
+            "paramIndex" -> ordinalNumber(1),
             "requiredType" -> toSQLType(IntegerType),
             "inputSql" -> toSQLExpr(second),
             "inputType" -> toSQLType(second.dataType))
@@ -5063,6 +5190,9 @@ case class ArrayCompact(child: Expression)
   override def inputTypes: Seq[AbstractDataType] = Seq(ArrayType)
 
   override def prettyName: String = "array_compact"
+
+  override def dataType: ArrayType =
+    child.dataType.asInstanceOf[ArrayType].copy(containsNull = false)
 
   override protected def withNewChildInternal(newChild: Expression): ArrayCompact =
     copy(child = newChild)

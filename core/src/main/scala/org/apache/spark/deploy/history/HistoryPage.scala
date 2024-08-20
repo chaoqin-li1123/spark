@@ -17,9 +17,9 @@
 
 package org.apache.spark.deploy.history
 
-import javax.servlet.http.HttpServletRequest
-
 import scala.xml.{Node, Unparsed}
+
+import jakarta.servlet.http.HttpServletRequest
 
 import org.apache.spark.status.api.v1.ApplicationInfo
 import org.apache.spark.ui.{UIUtils, WebUIPage}
@@ -105,7 +105,7 @@ private[history] class HistoryPage(parent: HistoryServer) extends WebUIPage("") 
       <script type="module" src={UIUtils.prependBaseUri(
         request, "/static/utils.js")}></script> ++
       summary ++ appList ++ pageLink
-    UIUtils.basicSparkPage(request, content, "History Server", true)
+    UIUtils.basicSparkPage(request, content, parent.title, true)
   }
 
   def shouldDisplayApplications(requestedIncomplete: Boolean): Boolean = {

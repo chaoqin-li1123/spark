@@ -19,7 +19,6 @@ package org.apache.spark.sql.execution
 
 import java.time.ZoneOffset
 import java.util.{Locale, TimeZone}
-import javax.ws.rs.core.UriBuilder
 
 import scala.jdk.CollectionConverters._
 
@@ -28,7 +27,7 @@ import org.antlr.v4.runtime.tree.TerminalNode
 
 import org.apache.spark.SparkException
 import org.apache.spark.sql.catalyst.{FunctionIdentifier, TableIdentifier}
-import org.apache.spark.sql.catalyst.analysis.{GlobalTempView, LocalTempView, PersistedView, UnresolvedFunctionName, UnresolvedIdentifier}
+import org.apache.spark.sql.catalyst.analysis.{GlobalTempView, LocalTempView, PersistedView, SchemaEvolution, SchemaTypeEvolution, UnresolvedFunctionName, UnresolvedIdentifier, UnresolvedNamespace}
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.expressions.{Expression, Literal}
 import org.apache.spark.sql.catalyst.parser._
@@ -42,6 +41,7 @@ import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.internal.{HiveSerDe, SQLConf, VariableSubstitution}
 import org.apache.spark.sql.internal.StaticSQLConf.CATALOG_IMPLEMENTATION
 import org.apache.spark.sql.types.StringType
+import org.apache.spark.util.Utils.getUriBuilder
 
 /**
  * Concrete parser for Spark SQL statements.
@@ -143,6 +143,18 @@ class SparkSqlAstBuilder extends AstBuilder {
   }
 
   /**
+   * Create a [[SetCommand]] logical plan to set [[SQLConf.DEFAULT_COLLATION]]
+   * Example SQL :
+   * {{{
+   *   SET COLLATION UNICODE;
+   * }}}
+   */
+  override def visitSetCollation(ctx: SetCollationContext): LogicalPlan = withOrigin(ctx) {
+    val key = SQLConf.DEFAULT_COLLATION.key
+    SetCommand(Some(key -> Some(ctx.identifier.getText.toUpperCase(Locale.ROOT))))
+  }
+
+  /**
    * Create a [[SetCommand]] logical plan to set [[SQLConf.SESSION_LOCAL_TIMEZONE]]
    * Example SQL :
    * {{{
@@ -220,10 +232,10 @@ class SparkSqlAstBuilder extends AstBuilder {
    */
   override def visitExplain(ctx: ExplainContext): LogicalPlan = withOrigin(ctx) {
     if (ctx.LOGICAL != null) {
-      operationNotAllowed("EXPLAIN LOGICAL", ctx)
+      invalidStatement("EXPLAIN LOGICAL", ctx)
     }
 
-    val statement = plan(ctx.statement)
+    val statement = plan(Option(ctx.statement()).getOrElse(ctx.setResetStatement()))
     if (statement == null) {
       null  // This is enough since ParseException will raise later.
     } else {
@@ -265,8 +277,8 @@ class SparkSqlAstBuilder extends AstBuilder {
    * Create a [[SetCatalogCommand]] logical command.
    */
   override def visitSetCatalog(ctx: SetCatalogContext): LogicalPlan = withOrigin(ctx) {
-    if (ctx.identifier() != null) {
-      SetCatalogCommand(ctx.identifier().getText)
+    if (ctx.errorCapturingIdentifier() != null) {
+      SetCatalogCommand(ctx.errorCapturingIdentifier().getText)
     } else if (ctx.stringLit() != null) {
       SetCatalogCommand(string(visitStringLit(ctx.stringLit())))
     } else {
@@ -316,19 +328,19 @@ class SparkSqlAstBuilder extends AstBuilder {
       super.visitCreateTable(ctx)
     } else {
       if (external) {
-        operationNotAllowed("CREATE EXTERNAL TABLE ... USING", ctx)
+        invalidStatement("CREATE EXTERNAL TABLE ... USING", ctx)
       }
       if (ifNotExists) {
         // Unlike CREATE TEMPORARY VIEW USING, CREATE TEMPORARY TABLE USING does not support
         // IF NOT EXISTS. Users are not allowed to replace the existing temp table.
-        operationNotAllowed("CREATE TEMPORARY TABLE IF NOT EXISTS", ctx)
+        invalidStatement("CREATE TEMPORARY TABLE IF NOT EXISTS", ctx)
       }
 
       val (_, _, _, _, options, location, _, _, _) =
         visitCreateTableClauses(ctx.createTableClauses())
       val provider = Option(ctx.tableProvider).map(_.multipartIdentifier.getText).getOrElse(
         throw QueryParsingErrors.createTempTableNotSpecifyProviderError(ctx))
-      val schema = Option(ctx.createOrReplaceTableColTypeList()).map(createSchema)
+      val schema = Option(ctx.colDefinitionList()).map(createSchema)
 
       logWarning(s"CREATE TEMPORARY TABLE ... USING ... is deprecated, please use " +
           "CREATE TEMPORARY VIEW ... USING ... instead")
@@ -384,19 +396,18 @@ class SparkSqlAstBuilder extends AstBuilder {
   }
 
   /**
-   * Fail an unsupported Hive native command.
+   * Fail an unsupported Hive native command (SET ROLE is handled separately).
    */
   override def visitFailNativeCommand(
-    ctx: FailNativeCommandContext): LogicalPlan = withOrigin(ctx) {
-    val keywords = if (ctx.unsupportedHiveNativeCommands != null) {
-      ctx.unsupportedHiveNativeCommands.children.asScala.collect {
-        case n: TerminalNode => n.getText
-      }.mkString(" ")
-    } else {
-      // SET ROLE is the exception to the rule, because we handle this before other SET commands.
-      "SET ROLE"
-    }
-    operationNotAllowed(keywords, ctx)
+      ctx: FailNativeCommandContext): LogicalPlan = withOrigin(ctx) {
+    val keywords = ctx.unsupportedHiveNativeCommands.children.asScala.collect {
+      case n: TerminalNode => n.getText
+    }.mkString(" ")
+    invalidStatement(keywords, ctx)
+  }
+
+  override def visitFailSetRole(ctx: FailSetRoleContext): LogicalPlan = withOrigin(ctx) {
+    invalidStatement("SET ROLE", ctx);
   }
 
   /**
@@ -489,10 +500,11 @@ class SparkSqlAstBuilder extends AstBuilder {
    */
   override def visitCreateView(ctx: CreateViewContext): LogicalPlan = withOrigin(ctx) {
     if (!ctx.identifierList.isEmpty) {
-      operationNotAllowed("CREATE VIEW ... PARTITIONED ON", ctx)
+      invalidStatement("CREATE VIEW ... PARTITIONED ON", ctx)
     }
 
     checkDuplicateClauses(ctx.commentSpec(), "COMMENT", ctx)
+    checkDuplicateClauses(ctx.schemaBinding(), "WITH SCHEMA", ctx)
     checkDuplicateClauses(ctx.PARTITIONED, "PARTITIONED ON", ctx)
     checkDuplicateClauses(ctx.TBLPROPERTIES, "TBLPROPERTIES", ctx)
 
@@ -510,6 +522,10 @@ class SparkSqlAstBuilder extends AstBuilder {
       .getOrElse(Map.empty)
     if (ctx.TEMPORARY != null && !properties.isEmpty) {
       operationNotAllowed("TBLPROPERTIES can't coexist with CREATE TEMPORARY VIEW", ctx)
+    }
+
+    if (ctx.TEMPORARY != null && ctx.schemaBinding(0) != null) {
+      throw QueryParsingErrors.temporaryViewWithSchemaBindingMode(ctx)
     }
 
     val viewType = if (ctx.TEMPORARY == null) {
@@ -531,6 +547,13 @@ class SparkSqlAstBuilder extends AstBuilder {
       val originalText = source(ctx.query)
       assert(Option(originalText).isDefined,
         "'originalText' must be provided to create permanent view")
+      val schemaBinding = visitSchemaBinding(ctx.schemaBinding(0))
+      val finalSchemaBinding =
+        if (schemaBinding == SchemaEvolution && userSpecifiedColumns.nonEmpty) {
+          SchemaTypeEvolution
+        } else {
+          schemaBinding
+        }
       CreateView(
         withIdentClause(ctx.identifierReference(), UnresolvedIdentifier(_)),
         userSpecifiedColumns,
@@ -539,7 +562,8 @@ class SparkSqlAstBuilder extends AstBuilder {
         Some(originalText),
         qPlan,
         ctx.EXISTS != null,
-        ctx.REPLACE != null)
+        ctx.REPLACE != null,
+        finalSchemaBinding)
     } else {
       // Disallows 'CREATE TEMPORARY VIEW IF NOT EXISTS' to be consistent with
       // 'CREATE TEMPORARY TABLE'
@@ -547,7 +571,7 @@ class SparkSqlAstBuilder extends AstBuilder {
         throw QueryParsingErrors.defineTempViewWithIfNotExistsError(ctx)
       }
 
-      withIdentClause(ctx.identifierReference(), ident => {
+      withIdentClause(ctx.identifierReference(), Seq(qPlan), (ident, otherPlans) => {
         val tableIdentifier = ident.asTableIdentifier
         if (tableIdentifier.database.isDefined) {
           // Temporary view names should NOT contain database prefix like "database.table"
@@ -561,7 +585,7 @@ class SparkSqlAstBuilder extends AstBuilder {
           visitCommentSpecList(ctx.commentSpec()),
           properties,
           Option(source(ctx.query)),
-          qPlan,
+          otherPlans.head,
           ctx.EXISTS != null,
           ctx.REPLACE != null,
           viewType = viewType)
@@ -623,6 +647,173 @@ class SparkSqlAstBuilder extends AstBuilder {
           ctx.REPLACE != null)
       }
     })
+  }
+
+  /**
+   * Create a [[CreateUserDefinedFunctionCommand]].
+   *
+   * For example:
+   * {{{
+   *   CREATE [OR REPLACE] [TEMPORARY] FUNCTION [IF NOT EXISTS] [db_name.]function_name
+   *   ([param_name param_type [COMMENT param_comment], ...])
+   *   RETURNS {ret_type | TABLE (ret_name ret_type [COMMENT ret_comment], ...])}
+   *   [routine_characteristic]
+   *   RETURN {expression | query };
+   *
+   *   routine_characteristic
+   *   { LANGUAGE {SQL | IDENTIFIER} |
+   *     [NOT] DETERMINISTIC |
+   *     COMMENT function_comment |
+   *     [CONTAINS SQL | READS SQL DATA] }
+   * }}}
+   */
+  override def visitCreateUserDefinedFunction(ctx: CreateUserDefinedFunctionContext): LogicalPlan =
+    withOrigin(ctx) {
+      assert(ctx.expression != null || ctx.query != null)
+
+      if (ctx.EXISTS != null && ctx.REPLACE != null) {
+        throw QueryParsingErrors.createFuncWithBothIfNotExistsAndReplaceError(ctx)
+      }
+
+      val inputParamText = Option(ctx.parameters).map(source)
+      val returnTypeText: String =
+        if (ctx.RETURNS != null &&
+          (Option(ctx.dataType).nonEmpty || Option(ctx.returnParams).nonEmpty)) {
+          source(Option(ctx.dataType).getOrElse(ctx.returnParams))
+        } else {
+          ""
+        }
+      val exprText = Option(ctx.expression()).map(source)
+      val queryText = Option(ctx.query()).map(source)
+
+      val (containsSQL, deterministic, comment, optionalLanguage) =
+        visitRoutineCharacteristics(ctx.routineCharacteristics())
+      val language: RoutineLanguage = optionalLanguage.getOrElse(LanguageSQL)
+      val isTableFunc = ctx.TABLE() != null || returnTypeText.equalsIgnoreCase("table")
+
+      withIdentClause(ctx.identifierReference(), functionIdentifier => {
+        if (ctx.TEMPORARY == null) {
+          // TODO: support creating persistent UDFs.
+          operationNotAllowed(s"creating persistent SQL functions is not supported", ctx)
+        } else {
+          // Disallow to define a temporary function with `IF NOT EXISTS`
+          if (ctx.EXISTS != null) {
+            throw QueryParsingErrors.defineTempFuncWithIfNotExistsError(ctx)
+          }
+
+          if (functionIdentifier.length > 2) {
+            throw QueryParsingErrors.unsupportedFunctionNameError(functionIdentifier, ctx)
+          } else if (functionIdentifier.length == 2) {
+            // Temporary function names should not contain database prefix like "database.function"
+            throw QueryParsingErrors.specifyingDBInCreateTempFuncError(functionIdentifier.head, ctx)
+          }
+
+          CreateUserDefinedFunctionCommand(
+            functionIdentifier.asFunctionIdentifier,
+            inputParamText,
+            returnTypeText,
+            exprText,
+            queryText,
+            comment,
+            deterministic,
+            containsSQL,
+            language,
+            isTableFunc,
+            isTemp = true,
+            ctx.EXISTS != null,
+            ctx.REPLACE != null
+          )
+        }
+      })
+    }
+
+  /**
+   * SQL function routine characteristics.
+   * Currently only deterministic clause and comment clause are used.
+   *
+   * routine language: [LANGUAGE SQL | IDENTIFIER]
+   * specific name: [SPECIFIC specific_name]
+   * routine data access: [NO SQL | CONTAINS SQL | READS SQL DATA | MODIFIES SQL DATA]
+   * routine null call: [RETURNS NULL ON NULL INPUT | CALLED ON NULL INPUT]
+   * routine determinism: [DETERMINISTIC | NOT DETERMINISTIC]
+   * comment: [COMMENT function_comment]
+   * rights: [SQL SECURITY INVOKER | SQL SECURITY DEFINER]
+   */
+  override def visitRoutineCharacteristics(ctx: RoutineCharacteristicsContext)
+  : (Option[Boolean], Option[Boolean], Option[String], Option[RoutineLanguage]) =
+    withOrigin(ctx) {
+      checkDuplicateClauses(ctx.routineLanguage(), "LANGUAGE", ctx)
+      checkDuplicateClauses(ctx.specificName(), "SPECIFIC", ctx)
+      checkDuplicateClauses(ctx.sqlDataAccess(), "SQL DATA ACCESS", ctx)
+      checkDuplicateClauses(ctx.nullCall(), "NULL CALL", ctx)
+      checkDuplicateClauses(ctx.deterministic(), "DETERMINISTIC", ctx)
+      checkDuplicateClauses(ctx.commentSpec(), "COMMENT", ctx)
+      checkDuplicateClauses(ctx.rightsClause(), "SQL SECURITY RIGHTS", ctx)
+
+      val language: Option[RoutineLanguage] = ctx
+        .routineLanguage()
+        .asScala
+        .headOption
+        .map(x => {
+          if (x.SQL() != null) {
+            LanguageSQL
+          } else {
+            val name: String = x.IDENTIFIER().getText()
+            operationNotAllowed(s"Unsupported language for user defined functions: $name", x)
+          }
+        })
+
+      val deterministic = ctx.deterministic().asScala.headOption.map(visitDeterminism)
+      val comment = visitCommentSpecList(ctx.commentSpec())
+
+      ctx.specificName().asScala.headOption.foreach(checkSpecificName)
+      ctx.nullCall().asScala.headOption.foreach(checkNullCall)
+      ctx.rightsClause().asScala.headOption.foreach(checkRightsClause)
+      val containsSQL: Option[Boolean] =
+        ctx.sqlDataAccess().asScala.headOption.map(visitDataAccess)
+      (containsSQL, deterministic, comment, language)
+    }
+
+  /**
+   * Check if the function has a SPECIFIC name,
+   * which is a way to provide an alternative name for the function.
+   * This check applies for all user defined functions.
+   * Use functionName to specify the function that is currently checked.
+   */
+  private def checkSpecificName(ctx: SpecificNameContext): Unit =
+    withOrigin(ctx) {
+      operationNotAllowed(s"SQL function with SPECIFIC name is not supported", ctx)
+    }
+
+  private def checkNullCall(ctx: NullCallContext): Unit = withOrigin(ctx) {
+    if (ctx.RETURNS() != null) {
+      operationNotAllowed("SQL function with RETURNS NULL ON NULL INPUT is not supported", ctx)
+    }
+  }
+
+  /**
+   * Check SQL function data access clause. Currently only READS SQL DATA and CONTAINS SQL
+   * are supported. Return true if the data access routine is CONTAINS SQL.
+   */
+  private def visitDataAccess(ctx: SqlDataAccessContext): Boolean = withOrigin(ctx) {
+    if (ctx.NO() != null) {
+      operationNotAllowed("SQL function with NO SQL is not supported", ctx)
+    }
+    if (ctx.MODIFIES() != null) {
+      operationNotAllowed("SQL function with MODIFIES SQL DATA is not supported", ctx)
+    }
+    return ctx.READS() == null
+  }
+
+  private def checkRightsClause(ctx: RightsClauseContext): Unit = withOrigin(ctx) {
+    if (ctx.INVOKER() != null) {
+      operationNotAllowed("SQL function with SQL SECURITY INVOKER is not supported", ctx)
+    }
+  }
+
+  private def visitDeterminism(ctx: DeterministicContext): Boolean = withOrigin(ctx) {
+    blockBang(ctx.errorCapturingNot())
+    ctx.errorCapturingNot() == null
   }
 
   /**
@@ -718,7 +909,7 @@ class SparkSqlAstBuilder extends AstBuilder {
     val serdeInfo = getSerdeInfo(
       ctx.rowFormat.asScala.toSeq, ctx.createFileFormat.asScala.toSeq, ctx)
     if (provider.isDefined && serdeInfo.isDefined) {
-      operationNotAllowed(s"CREATE TABLE LIKE ... USING ... ${serdeInfo.get.describe}", ctx)
+      invalidStatement(s"CREATE TABLE LIKE ... USING ... ${serdeInfo.get.describe}", ctx)
     }
 
     // For "CREATE TABLE dst LIKE src ROW FORMAT SERDE xxx" which doesn't specify the file format,
@@ -862,7 +1053,7 @@ class SparkSqlAstBuilder extends AstBuilder {
           throw QueryParsingErrors.unsupportedLocalFileSchemeError(ctx, pathScheme)
         case _ =>
           // force scheme to be file rather than fs.default.name
-          val loc = Some(UriBuilder.fromUri(CatalogUtils.stringToURI(path)).scheme("file").build())
+          val loc = Some(getUriBuilder(CatalogUtils.stringToURI(path)).scheme("file").build())
           storage = storage.copy(locationUri = loc)
       }
     }
@@ -902,5 +1093,23 @@ class SparkSqlAstBuilder extends AstBuilder {
       serde = storage.serde.orElse(default.serde))
 
     (ctx.LOCAL != null, finalStorage, Some(DDLUtils.HIVE_PROVIDER))
+  }
+
+  /**
+   * Create a [[UnsetNamespacePropertiesCommand]] command.
+   *
+   * Expected format:
+   * {{{
+   *   ALTER (DATABASE|SCHEMA|NAMESPACE) database
+   *   UNSET (DBPROPERTIES | PROPERTIES) ('key1', 'key2');
+   * }}}
+   */
+  override def visitUnsetNamespaceProperties(
+      ctx: UnsetNamespacePropertiesContext): LogicalPlan = withOrigin(ctx) {
+    val properties = visitPropertyKeys(ctx.propertyList)
+    val cleanedProperties = cleanNamespaceProperties(properties.map(_ -> "").toMap, ctx).keys.toSeq
+    UnsetNamespacePropertiesCommand(
+      withIdentClause(ctx.identifierReference(), UnresolvedNamespace(_)),
+      cleanedProperties)
   }
 }

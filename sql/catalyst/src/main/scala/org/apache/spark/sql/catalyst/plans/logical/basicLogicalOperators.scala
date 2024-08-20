@@ -783,6 +783,7 @@ object View {
         "spark.sql.hive.convertMetastoreParquet",
         "spark.sql.hive.convertMetastoreOrc",
         "spark.sql.hive.convertInsertingPartitionedTable",
+        "spark.sql.hive.convertInsertingUnpartitionedTable",
         "spark.sql.hive.convertMetastoreCtas"
       ).contains(key) || key.startsWith("spark.sql.catalog.")
     }
@@ -910,6 +911,10 @@ case class WithCTE(plan: LogicalPlan, cteDefs: Seq[CTERelationDef]) extends Logi
   def withNewPlan(newPlan: LogicalPlan): WithCTE = {
     withNewChildren(children.init :+ newPlan).asInstanceOf[WithCTE]
   }
+
+  override def maxRows: Option[Long] = plan.maxRows
+
+  override def maxRowsPerPartition: Option[Long] = plan.maxRowsPerPartition
 }
 
 /**
@@ -1070,7 +1075,8 @@ case class Range(
   override def newInstance(): Range = copy(output = output.map(_.newInstance()))
 
   override def simpleString(maxFields: Int): String = {
-    s"Range ($start, $end, step=$step, splits=$numSlices)"
+    val splits = if (numSlices.isDefined) { s", splits=$numSlices" } else { "" }
+    s"Range ($start, $end, step=$step$splits)"
   }
 
   override def maxRows: Option[Long] = {
@@ -1232,9 +1238,11 @@ object Aggregate {
     schema.forall(f => UnsafeRow.isMutable(f.dataType))
   }
 
-  def supportsHashAggregate(aggregateBufferAttributes: Seq[Attribute]): Boolean = {
+  def supportsHashAggregate(
+      aggregateBufferAttributes: Seq[Attribute], groupingExpression: Seq[Expression]): Boolean = {
     val aggregationBufferSchema = DataTypeUtils.fromAttributes(aggregateBufferAttributes)
-    isAggregateBufferMutable(aggregationBufferSchema)
+    isAggregateBufferMutable(aggregationBufferSchema) &&
+      groupingExpression.forall(e => UnsafeRowUtils.isBinaryStable(e.dataType))
   }
 
   def supportsObjectHashAggregate(aggregateExpressions: Seq[AggregateExpression]): Boolean = {
@@ -1991,6 +1999,16 @@ case class DeduplicateWithinWatermark(keys: Seq[Attribute], child: LogicalPlan) 
 trait SupportsSubquery extends LogicalPlan
 
 /**
+ * Trait that logical plans can extend to check whether it can allow non-deterministic
+ * expressions and pass the CheckAnalysis rule.
+ */
+trait SupportsNonDeterministicExpression extends LogicalPlan {
+
+  /** Returns whether it allows non-deterministic expressions. */
+  def allowNonDeterministicExpression: Boolean
+}
+
+/**
  * Collect arbitrary (named) metrics from a dataset. As soon as the query reaches a completion
  * point (batch query completes or streaming query epoch completes) an event is emitted on the
  * driver which can be observed by attaching a listener to the spark session. The metrics are named
@@ -2053,6 +2071,8 @@ case class LateralJoin(
     right: LateralSubquery,
     joinType: JoinType,
     condition: Option[Expression]) extends UnaryNode {
+
+  override lazy val allAttributes: AttributeSeq = left.output ++ right.plan.output
 
   require(Seq(Inner, LeftOuter, Cross).contains(joinType),
     s"Unsupported lateral join type $joinType")

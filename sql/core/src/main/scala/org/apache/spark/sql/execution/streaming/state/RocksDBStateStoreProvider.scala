@@ -18,20 +18,28 @@
 package org.apache.spark.sql.execution.streaming.state
 
 import java.io._
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
+import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
 import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.Path
 
-import org.apache.spark.{SparkConf, SparkEnv}
-import org.apache.spark.internal.Logging
+import org.apache.spark.{SparkConf, SparkEnv, SparkException}
+import org.apache.spark.internal.{Logging, MDC}
+import org.apache.spark.internal.LogKeys._
+import org.apache.spark.io.CompressionCodec
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
 import org.apache.spark.sql.errors.QueryExecutionErrors
+import org.apache.spark.sql.execution.streaming.CheckpointFileManager
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.Utils
 
 private[sql] class RocksDBStateStoreProvider
-  extends StateStoreProvider with Logging with Closeable {
+  extends StateStoreProvider with Logging with Closeable
+  with SupportsFineGrainedReplay {
   import RocksDBStateStoreProvider._
 
   class RocksDBStateStore(lastVersion: Long) extends StateStore {
@@ -48,16 +56,29 @@ private[sql] class RocksDBStateStoreProvider
 
     override def version: Long = lastVersion
 
-    override def createColFamilyIfAbsent(colFamilyName: String): Unit = {
-      verify(colFamilyName != StateStore.DEFAULT_COL_FAMILY_NAME,
-        s"Failed to create column family with reserved_name=$colFamilyName")
-      rocksDB.createColFamilyIfAbsent(colFamilyName)
+    override def createColFamilyIfAbsent(
+        colFamilyName: String,
+        keySchema: StructType,
+        valueSchema: StructType,
+        keyStateEncoderSpec: KeyStateEncoderSpec,
+        useMultipleValuesPerKey: Boolean = false,
+        isInternal: Boolean = false): Unit = {
+      val newColFamilyId = ColumnFamilyUtils.createColFamilyIfAbsent(colFamilyName, isInternal)
+
+      keyValueEncoderMap.putIfAbsent(colFamilyName,
+        (RocksDBStateEncoder.getKeyEncoder(keyStateEncoderSpec, useColumnFamilies, newColFamilyId),
+         RocksDBStateEncoder.getValueEncoder(valueSchema, useMultipleValuesPerKey)))
     }
 
     override def get(key: UnsafeRow, colFamilyName: String): UnsafeRow = {
       verify(key != null, "Key cannot be null")
-      val value = encoder.decodeValue(rocksDB.get(encoder.encodeKey(key), colFamilyName))
-      if (!isValidated && value != null) {
+      ColumnFamilyUtils.verifyColFamilyOperations("get", colFamilyName)
+
+      val kvEncoder = keyValueEncoderMap.get(colFamilyName)
+      val value =
+        kvEncoder._2.decodeValue(rocksDB.get(kvEncoder._1.encodeKey(key)))
+
+      if (!isValidated && value != null && !useColumnFamilies) {
         StateStoreProvider.validateStateRowFormat(
           key, keySchema, value, valueSchema, storeConf)
         isValidated = true
@@ -65,37 +86,117 @@ private[sql] class RocksDBStateStoreProvider
       value
     }
 
+    /**
+     * Provides an iterator containing all values of a non-null key.
+     *
+     * Inside RocksDB, the values are merged together and stored as a byte Array.
+     * This operation relies on state store value encoder to be able to split the
+     * single array into multiple values.
+     *
+     * Also see [[MultiValuedStateEncoder]] which supports encoding/decoding multiple
+     * values per key.
+     */
+    override def valuesIterator(key: UnsafeRow, colFamilyName: String): Iterator[UnsafeRow] = {
+      verify(key != null, "Key cannot be null")
+      ColumnFamilyUtils.verifyColFamilyOperations("valuesIterator", colFamilyName)
+
+      val kvEncoder = keyValueEncoderMap.get(colFamilyName)
+      val valueEncoder = kvEncoder._2
+      val keyEncoder = kvEncoder._1
+
+      verify(valueEncoder.supportsMultipleValuesPerKey, "valuesIterator requires a encoder " +
+      "that supports multiple values for a single key.")
+
+      val encodedValues = rocksDB.get(keyEncoder.encodeKey(key))
+      valueEncoder.decodeValues(encodedValues)
+    }
+
+    override def merge(key: UnsafeRow, value: UnsafeRow,
+        colFamilyName: String = StateStore.DEFAULT_COL_FAMILY_NAME): Unit = {
+      verify(state == UPDATING, "Cannot merge after already committed or aborted")
+      ColumnFamilyUtils.verifyColFamilyOperations("merge", colFamilyName)
+
+      val kvEncoder = keyValueEncoderMap.get(colFamilyName)
+      val keyEncoder = kvEncoder._1
+      val valueEncoder = kvEncoder._2
+      verify(valueEncoder.supportsMultipleValuesPerKey, "Merge operation requires an encoder" +
+        " which supports multiple values for a single key")
+      verify(key != null, "Key cannot be null")
+      require(value != null, "Cannot merge a null value")
+
+      rocksDB.merge(keyEncoder.encodeKey(key), valueEncoder.encodeValue(value))
+    }
+
     override def put(key: UnsafeRow, value: UnsafeRow, colFamilyName: String): Unit = {
       verify(state == UPDATING, "Cannot put after already committed or aborted")
       verify(key != null, "Key cannot be null")
       require(value != null, "Cannot put a null value")
-      rocksDB.put(encoder.encodeKey(key), encoder.encodeValue(value), colFamilyName)
+      ColumnFamilyUtils.verifyColFamilyOperations("put", colFamilyName)
+
+      val kvEncoder = keyValueEncoderMap.get(colFamilyName)
+      rocksDB.put(kvEncoder._1.encodeKey(key), kvEncoder._2.encodeValue(value))
     }
 
     override def remove(key: UnsafeRow, colFamilyName: String): Unit = {
       verify(state == UPDATING, "Cannot remove after already committed or aborted")
       verify(key != null, "Key cannot be null")
-      rocksDB.remove(encoder.encodeKey(key), colFamilyName)
+      ColumnFamilyUtils.verifyColFamilyOperations("remove", colFamilyName)
+
+      val kvEncoder = keyValueEncoderMap.get(colFamilyName)
+      rocksDB.remove(kvEncoder._1.encodeKey(key))
     }
 
     override def iterator(colFamilyName: String): Iterator[UnsafeRowPair] = {
-      rocksDB.iterator(colFamilyName).map { kv =>
-        val rowPair = encoder.decode(kv)
-        if (!isValidated && rowPair.value != null) {
-          StateStoreProvider.validateStateRowFormat(
-            rowPair.key, keySchema, rowPair.value, valueSchema, storeConf)
-          isValidated = true
+      // Note this verify function only verify on the colFamilyName being valid,
+      // we are actually doing prefix when useColumnFamilies,
+      // but pass "iterator" to throw correct error message
+      ColumnFamilyUtils.verifyColFamilyOperations("iterator", colFamilyName)
+      val kvEncoder = keyValueEncoderMap.get(colFamilyName)
+      val rowPair = new UnsafeRowPair()
+
+      // As Virtual Column Family attaches a column family prefix to the key row,
+      // we'll need to do prefixScan on the default column family with the same column
+      // family id prefix to get all rows stored in a given virtual column family
+      if (useColumnFamilies) {
+        rocksDB.prefixScan(kvEncoder._1.getColumnFamilyIdBytes()).map { kv =>
+          rowPair.withRows(kvEncoder._1.decodeKey(kv.key),
+            kvEncoder._2.decodeValue(kv.value))
+          if (!isValidated && rowPair.value != null && !useColumnFamilies) {
+            StateStoreProvider.validateStateRowFormat(
+              rowPair.key, keySchema, rowPair.value, valueSchema, storeConf)
+            isValidated = true
+          }
+          rowPair
         }
-        rowPair
+      } else {
+        rocksDB.iterator().map { kv =>
+          rowPair.withRows(kvEncoder._1.decodeKey(kv.key),
+            kvEncoder._2.decodeValue(kv.value))
+          if (!isValidated && rowPair.value != null && !useColumnFamilies) {
+            StateStoreProvider.validateStateRowFormat(
+              rowPair.key, keySchema, rowPair.value, valueSchema, storeConf)
+            isValidated = true
+          }
+          rowPair
+        }
       }
     }
 
     override def prefixScan(prefixKey: UnsafeRow, colFamilyName: String):
       Iterator[UnsafeRowPair] = {
-      require(encoder.supportPrefixKeyScan, "Prefix scan requires setting prefix key!")
+      ColumnFamilyUtils.verifyColFamilyOperations("prefixScan", colFamilyName)
 
-      val prefix = encoder.encodePrefixKey(prefixKey)
-      rocksDB.prefixScan(prefix, colFamilyName).map(kv => encoder.decode(kv))
+      val kvEncoder = keyValueEncoderMap.get(colFamilyName)
+      require(kvEncoder._1.supportPrefixKeyScan,
+        "Prefix scan requires setting prefix key!")
+
+      val rowPair = new UnsafeRowPair()
+      val prefix = kvEncoder._1.encodePrefixKey(prefixKey)
+      rocksDB.prefixScan(prefix).map { kv =>
+        rowPair.withRows(kvEncoder._1.decodeKey(kv.key),
+          kvEncoder._2.decodeValue(kv.value))
+        rowPair
+      }
     }
 
     override def commit(): Long = synchronized {
@@ -103,7 +204,8 @@ private[sql] class RocksDBStateStoreProvider
         verify(state == UPDATING, "Cannot commit after already committed or aborted")
         val newVersion = rocksDB.commit()
         state = COMMITTED
-        logInfo(s"Committed $newVersion for $id")
+        logInfo(log"Committed ${MDC(VERSION_NUM, newVersion)} " +
+          log"for ${MDC(STATE_STORE_ID, id)}")
         newVersion
       } catch {
         case e: Throwable =>
@@ -113,7 +215,8 @@ private[sql] class RocksDBStateStoreProvider
 
     override def abort(): Unit = {
       verify(state == UPDATING || state == ABORTED, "Cannot abort after already committed")
-      logInfo(s"Aborting ${version + 1} for $id")
+      logInfo(log"Aborting ${MDC(VERSION_NUM, version + 1)} " +
+        log"for ${MDC(STATE_STORE_ID, id)}")
       rocksDB.rollback()
       state = ABORTED
     }
@@ -143,6 +246,17 @@ private[sql] class RocksDBStateStoreProvider
           rocksDBMetrics.nativeOpsMetrics.getOrElse(typ, 0)
         }
 
+        // Used for metrics reporting around internal/external column families
+        def internalColFamilyCnt(): Long = {
+          colFamilyNameToIdMap.keys.asScala.toSeq
+            .filter(ColumnFamilyUtils.checkInternalColumnFamilies(_)).size
+        }
+
+        def externalColFamilyCnt(): Long = {
+          colFamilyNameToIdMap.keys.asScala.toSeq
+            .filter(!ColumnFamilyUtils.checkInternalColumnFamilies(_)).size
+        }
+
         val stateStoreCustomMetrics = Map[StateStoreCustomMetric, Long](
           CUSTOM_METRIC_SST_FILE_SIZE -> rocksDBMetrics.totalSSTFilesBytes,
           CUSTOM_METRIC_GET_TIME -> sumNativeOpsLatencyMillis("get"),
@@ -166,7 +280,9 @@ private[sql] class RocksDBStateStoreProvider
           CUSTOM_METRIC_COMPACT_READ_BYTES -> nativeOpsMetrics("totalBytesReadByCompaction"),
           CUSTOM_METRIC_COMPACT_WRITTEN_BYTES -> nativeOpsMetrics("totalBytesWrittenByCompaction"),
           CUSTOM_METRIC_FLUSH_WRITTEN_BYTES -> nativeOpsMetrics("totalBytesWrittenByFlush"),
-          CUSTOM_METRIC_PINNED_BLOCKS_MEM_USAGE -> rocksDBMetrics.pinnedBlocksMemUsage
+          CUSTOM_METRIC_PINNED_BLOCKS_MEM_USAGE -> rocksDBMetrics.pinnedBlocksMemUsage,
+          CUSTOM_METRIC_NUM_EXTERNAL_COL_FAMILIES -> internalColFamilyCnt(),
+          CUSTOM_METRIC_NUM_INTERNAL_COL_FAMILIES -> externalColFamilyCnt()
         ) ++ rocksDBMetrics.zipFileBytesUncompressed.map(bytes =>
           Map(CUSTOM_METRIC_ZIP_FILE_BYTES_UNCOMPRESSED -> bytes)).getOrElse(Map())
 
@@ -175,7 +291,8 @@ private[sql] class RocksDBStateStoreProvider
           rocksDBMetrics.totalMemUsageBytes,
           stateStoreCustomMetrics)
       } else {
-        logInfo(s"Failed to collect metrics for store_id=$id and version=$version")
+        logInfo(log"Failed to collect metrics for store_id=${MDC(STATE_STORE_ID, id)} " +
+          log"and version=${MDC(VERSION_NUM, version)}")
         StateStoreMetrics(0, 0, Map.empty)
       }
     }
@@ -189,16 +306,37 @@ private[sql] class RocksDBStateStoreProvider
 
     /** Return the [[RocksDB]] instance in this store. This is exposed mainly for testing. */
     def dbInstance(): RocksDB = rocksDB
+
+    /** Remove column family if exists */
+    override def removeColFamilyIfExists(colFamilyName: String): Boolean = {
+      verify(useColumnFamilies, "Column families are not supported in this store")
+
+      val result = {
+        val colFamilyExists = ColumnFamilyUtils.removeColFamilyIfExists(colFamilyName)
+
+        if (colFamilyExists) {
+          val colFamilyIdBytes =
+            keyValueEncoderMap.get(colFamilyName)._1.getColumnFamilyIdBytes()
+          rocksDB.prefixScan(colFamilyIdBytes).foreach { kv =>
+            rocksDB.remove(kv.key)
+          }
+        }
+        colFamilyExists
+      }
+      keyValueEncoderMap.remove(colFamilyName)
+      result
+    }
   }
 
   override def init(
       stateStoreId: StateStoreId,
       keySchema: StructType,
       valueSchema: StructType,
-      numColsPrefixKey: Int,
+      keyStateEncoderSpec: KeyStateEncoderSpec,
       useColumnFamilies: Boolean,
       storeConf: StateStoreConf,
-      hadoopConf: Configuration): Unit = {
+      hadoopConf: Configuration,
+      useMultipleValuesPerKey: Boolean = false): Unit = {
     this.stateStoreId_ = stateStoreId
     this.keySchema = keySchema
     this.valueSchema = valueSchema
@@ -206,11 +344,21 @@ private[sql] class RocksDBStateStoreProvider
     this.hadoopConf = hadoopConf
     this.useColumnFamilies = useColumnFamilies
 
-    require((keySchema.length == 0 && numColsPrefixKey == 0) ||
-      (keySchema.length > numColsPrefixKey), "The number of columns in the key must be " +
-      "greater than the number of columns for prefix key!")
+    if (useMultipleValuesPerKey) {
+      require(useColumnFamilies, "Multiple values per key support requires column families to be" +
+        " enabled in RocksDBStateStore.")
+    }
 
-    this.encoder = RocksDBStateEncoder.getEncoder(keySchema, valueSchema, numColsPrefixKey)
+    var defaultColFamilyId: Option[Short] = None
+    if (useColumnFamilies) {
+      // put default column family only if useColumnFamilies are enabled
+      colFamilyNameToIdMap.putIfAbsent(StateStore.DEFAULT_COL_FAMILY_NAME, colFamilyId.shortValue())
+      defaultColFamilyId = Option(colFamilyId.shortValue())
+    }
+    keyValueEncoderMap.putIfAbsent(StateStore.DEFAULT_COL_FAMILY_NAME,
+      (RocksDBStateEncoder.getKeyEncoder(keyStateEncoderSpec,
+        useColumnFamilies, defaultColFamilyId),
+        RocksDBStateEncoder.getValueEncoder(valueSchema, useMultipleValuesPerKey)))
 
     rocksDB // lazy initialization
   }
@@ -226,6 +374,13 @@ private[sql] class RocksDBStateStoreProvider
       new RocksDBStateStore(version)
     }
     catch {
+      case e: SparkException if e.getErrorClass.contains("CANNOT_LOAD_STATE_STORE") =>
+        throw e
+      case e: OutOfMemoryError =>
+        throw QueryExecutionErrors.notEnoughMemoryToLoadStore(
+          stateStoreId.toString,
+          "ROCKSDB_STORE_PROVIDER",
+          e)
       case e: Throwable => throw QueryExecutionErrors.cannotLoadStore(e)
     }
   }
@@ -239,6 +394,13 @@ private[sql] class RocksDBStateStoreProvider
       new RocksDBStateStore(version)
     }
     catch {
+      case e: SparkException if e.getErrorClass.contains("CANNOT_LOAD_STATE_STORE") =>
+        throw e
+      case e: OutOfMemoryError =>
+        throw QueryExecutionErrors.notEnoughMemoryToLoadStore(
+          stateStoreId.toString,
+          "ROCKSDB_STORE_PROVIDER",
+          e)
       case e: Throwable => throw QueryExecutionErrors.cannotLoadStore(e)
     }
   }
@@ -282,10 +444,171 @@ private[sql] class RocksDBStateStoreProvider
       useColumnFamilies)
   }
 
-  @volatile private var encoder: RocksDBStateEncoder = _
+  private val keyValueEncoderMap = new java.util.concurrent.ConcurrentHashMap[String,
+    (RocksDBKeyStateEncoder, RocksDBValueStateEncoder)]
+
+  private val colFamilyNameToIdMap = new java.util.concurrent.ConcurrentHashMap[String, Short]
+  // TODO SPARK-48796 load column family id from state schema when restarting
+  private val colFamilyId = new AtomicInteger(0)
 
   private def verify(condition: => Boolean, msg: String): Unit = {
     if (!condition) { throw new IllegalStateException(msg) }
+  }
+
+  /**
+   * Get the state store of endVersion by applying delta files on the snapshot of snapshotVersion.
+   * If snapshot for snapshotVersion does not exist, an error will be thrown.
+   *
+   * @param snapshotVersion checkpoint version of the snapshot to start with
+   * @param endVersion   checkpoint version to end with
+   * @return [[StateStore]]
+   */
+  override def replayStateFromSnapshot(snapshotVersion: Long, endVersion: Long): StateStore = {
+    try {
+      if (snapshotVersion < 1) {
+        throw QueryExecutionErrors.unexpectedStateStoreVersion(snapshotVersion)
+      }
+      if (endVersion < snapshotVersion) {
+        throw QueryExecutionErrors.unexpectedStateStoreVersion(endVersion)
+      }
+      rocksDB.loadFromSnapshot(snapshotVersion, endVersion)
+      new RocksDBStateStore(endVersion)
+    }
+    catch {
+      case e: OutOfMemoryError =>
+        throw QueryExecutionErrors.notEnoughMemoryToLoadStore(
+          stateStoreId.toString,
+          "ROCKSDB_STORE_PROVIDER",
+          e)
+      case e: Throwable => throw QueryExecutionErrors.cannotLoadStore(e)
+    }
+  }
+
+  override def getStateStoreChangeDataReader(startVersion: Long, endVersion: Long):
+    StateStoreChangeDataReader = {
+    val statePath = stateStoreId.storeCheckpointLocation()
+    val sparkConf = Option(SparkEnv.get).map(_.conf).getOrElse(new SparkConf)
+    new RocksDBStateStoreChangeDataReader(
+      CheckpointFileManager.create(statePath, hadoopConf),
+      statePath,
+      startVersion,
+      endVersion,
+      CompressionCodec.createCodec(sparkConf, storeConf.compressionCodec),
+      keyValueEncoderMap)
+  }
+
+  /**
+   * Class for column family related utility functions.
+   * Verification functions for column family names, column family operation validations etc.
+   */
+  private object ColumnFamilyUtils {
+    private val multColFamiliesDisabledStr = "multiple column families is disabled in " +
+      "RocksDBStateStoreProvider"
+
+    /**
+     * Function to verify invariants for column family based operations
+     * such as get, put, remove etc.
+     *
+     * @param operationName - name of the store operation
+     * @param colFamilyName - name of the column family
+     */
+    def verifyColFamilyOperations(
+        operationName: String,
+        colFamilyName: String): Unit = {
+      if (colFamilyName != StateStore.DEFAULT_COL_FAMILY_NAME) {
+        // if the state store instance does not support multiple column families, throw an exception
+        if (!useColumnFamilies) {
+          throw StateStoreErrors.unsupportedOperationException(operationName,
+            multColFamiliesDisabledStr)
+        }
+
+        // if the column family name is empty or contains leading/trailing whitespaces, throw an
+        // exception
+        if (colFamilyName.isEmpty || colFamilyName.trim != colFamilyName) {
+          throw StateStoreErrors.cannotUseColumnFamilyWithInvalidName(operationName, colFamilyName)
+        }
+
+        // if the column family does not exist, throw an exception
+        if (!checkColFamilyExists(colFamilyName)) {
+          throw StateStoreErrors.unsupportedOperationOnMissingColumnFamily(operationName,
+            colFamilyName)
+        }
+      }
+    }
+
+    /**
+     * Function to verify invariants for column family creation or deletion operations.
+     *
+     * @param operationName - name of the store operation
+     * @param colFamilyName - name of the column family
+     */
+    private def verifyColFamilyCreationOrDeletion(
+        operationName: String,
+        colFamilyName: String,
+        isInternal: Boolean = false): Unit = {
+      // if the state store instance does not support multiple column families, throw an exception
+      if (!useColumnFamilies) {
+        throw StateStoreErrors.unsupportedOperationException(operationName,
+          multColFamiliesDisabledStr)
+      }
+
+      // if the column family name is empty or contains leading/trailing whitespaces
+      // or using the reserved "default" column family, throw an exception
+      if (colFamilyName.isEmpty
+        || colFamilyName.trim != colFamilyName
+        || colFamilyName == StateStore.DEFAULT_COL_FAMILY_NAME) {
+        throw StateStoreErrors.cannotUseColumnFamilyWithInvalidName(operationName, colFamilyName)
+      }
+
+      // if the column family is not internal and uses reserved characters, throw an exception
+      if (!isInternal && colFamilyName.charAt(0) == '_') {
+        throw StateStoreErrors.cannotCreateColumnFamilyWithReservedChars(colFamilyName)
+      }
+    }
+
+    /**
+     * Check whether the column family name is for internal column families.
+     *
+     * @param cfName - column family name
+     * @return - true if the column family is for internal use, false otherwise
+     */
+    def checkInternalColumnFamilies(cfName: String): Boolean = cfName.charAt(0) == '_'
+
+    /**
+     * Create RocksDB column family, if not created already
+     */
+    def createColFamilyIfAbsent(colFamilyName: String, isInternal: Boolean = false):
+      Option[Short] = {
+      verifyColFamilyCreationOrDeletion("create_col_family", colFamilyName, isInternal)
+      if (!checkColFamilyExists(colFamilyName)) {
+        val newColumnFamilyId = colFamilyId.incrementAndGet().toShort
+        colFamilyNameToIdMap.putIfAbsent(colFamilyName, newColumnFamilyId)
+        Option(newColumnFamilyId)
+      } else None
+    }
+
+    /**
+     * Remove RocksDB column family, if exists
+     */
+    def removeColFamilyIfExists(colFamilyName: String): Boolean = {
+      verifyColFamilyCreationOrDeletion("remove_col_family", colFamilyName)
+      if (checkColFamilyExists(colFamilyName)) {
+        colFamilyNameToIdMap.remove(colFamilyName)
+        true
+      } else {
+        false
+      }
+    }
+
+    /**
+     * Function to check if the column family exists in the state store instance.
+     *
+     * @param colFamilyName - name of the column family
+     * @return - true if the column family exists, false otherwise
+     */
+    def checkColFamilyExists(colFamilyName: String): Boolean = {
+      colFamilyNameToIdMap.containsKey(colFamilyName)
+    }
   }
 }
 
@@ -293,6 +616,7 @@ object RocksDBStateStoreProvider {
   // Version as a single byte that specifies the encoding of the row data in RocksDB
   val STATE_ENCODING_NUM_VERSION_BYTES = 1
   val STATE_ENCODING_VERSION: Byte = 0
+  val VIRTUAL_COL_FAMILY_PREFIX_BYTES = 2
 
   // Native operation latencies report as latency in microseconds
   // as SQLMetrics support millis. Convert the value to millis
@@ -358,6 +682,12 @@ object RocksDBStateStoreProvider {
   val CUSTOM_METRIC_PINNED_BLOCKS_MEM_USAGE = StateStoreCustomSizeMetric(
     "rocksdbPinnedBlocksMemoryUsage",
     "RocksDB: memory usage for pinned blocks")
+  val CUSTOM_METRIC_NUM_EXTERNAL_COL_FAMILIES = StateStoreCustomSizeMetric(
+    "rocksdbNumExternalColumnFamilies",
+    "RocksDB: number of external column families")
+  val CUSTOM_METRIC_NUM_INTERNAL_COL_FAMILIES = StateStoreCustomSizeMetric(
+    "rocksdbNumInternalColumnFamilies",
+    "RocksDB: number of internal column families")
 
   // Total SST file size
   val CUSTOM_METRIC_SST_FILE_SIZE = StateStoreCustomSizeMetric(
@@ -373,6 +703,39 @@ object RocksDBStateStoreProvider {
     CUSTOM_METRIC_BYTES_WRITTEN, CUSTOM_METRIC_ITERATOR_BYTES_READ, CUSTOM_METRIC_STALL_TIME,
     CUSTOM_METRIC_TOTAL_COMPACT_TIME, CUSTOM_METRIC_COMPACT_READ_BYTES,
     CUSTOM_METRIC_COMPACT_WRITTEN_BYTES, CUSTOM_METRIC_FLUSH_WRITTEN_BYTES,
-    CUSTOM_METRIC_PINNED_BLOCKS_MEM_USAGE
-  )
+    CUSTOM_METRIC_PINNED_BLOCKS_MEM_USAGE, CUSTOM_METRIC_NUM_EXTERNAL_COL_FAMILIES,
+    CUSTOM_METRIC_NUM_INTERNAL_COL_FAMILIES)
+}
+
+/** [[StateStoreChangeDataReader]] implementation for [[RocksDBStateStoreProvider]] */
+class RocksDBStateStoreChangeDataReader(
+    fm: CheckpointFileManager,
+    stateLocation: Path,
+    startVersion: Long,
+    endVersion: Long,
+    compressionCodec: CompressionCodec,
+    keyValueEncoderMap:
+      ConcurrentHashMap[String, (RocksDBKeyStateEncoder, RocksDBValueStateEncoder)])
+  extends StateStoreChangeDataReader(
+    fm, stateLocation, startVersion, endVersion, compressionCodec) {
+
+  override protected var changelogSuffix: String = "changelog"
+
+  override def getNext(): (RecordType.Value, UnsafeRow, UnsafeRow, Long) = {
+    val reader = currentChangelogReader()
+    if (reader == null) {
+      return null
+    }
+    val (recordType, keyArray, valueArray) = reader.next()
+    // Todo: does not support multiple virtual column families
+    val (rocksDBKeyStateEncoder, rocksDBValueStateEncoder) =
+      keyValueEncoderMap.get(StateStore.DEFAULT_COL_FAMILY_NAME)
+    val keyRow = rocksDBKeyStateEncoder.decodeKey(keyArray)
+    if (valueArray == null) {
+      (recordType, keyRow, null, currentChangelogVersion - 1)
+    } else {
+      val valueRow = rocksDBValueStateEncoder.decodeValue(valueArray)
+      (recordType, keyRow, valueRow, currentChangelogVersion - 1)
+    }
+  }
 }
