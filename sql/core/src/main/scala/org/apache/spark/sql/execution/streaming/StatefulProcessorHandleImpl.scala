@@ -25,10 +25,10 @@ import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.Encoder
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
+import org.apache.spark.sql.execution.streaming.state.StateStore
 import org.apache.spark.sql.execution.metric.SQLMetric
-import org.apache.spark.sql.execution.streaming.StatefulProcessorHandleState.PRE_INIT
 import org.apache.spark.sql.execution.streaming.state._
-import org.apache.spark.sql.streaming.{ListState, MapState, QueryInfo, TimeMode, TTLConfig, ValueState}
+import org.apache.spark.sql.streaming.{ListState, MapState, QueryInfo, SerializationType, TimeMode, TTLConfig, ValueState}
 import org.apache.spark.util.Utils
 
 /**
@@ -121,12 +121,19 @@ class StatefulProcessorHandleImpl(
     metrics.get(metricName).foreach(_.add(1))
   }
 
+  def setHandleState(newState: StatefulProcessorHandleState): Unit = {
+    currState = newState
+  }
+
+  def getHandleState: StatefulProcessorHandleState = currState
+
   override def getValueState[T](
-      stateName: String,
-      valEncoder: Encoder[T]): ValueState[T] = {
-    verifyStateVarOperations("get_value_state", CREATED)
-    incrementMetric("numValueStateVars")
-    val resultState = new ValueStateImpl[T](store, stateName, keyEncoder, valEncoder)
+      stateName: String, valEncoder: Encoder[T],
+      serializer: SerializationType.Value = SerializationType.JAVA): ValueState[T] = {
+    verify(currState == CREATED, s"Cannot create state variable with name=$stateName after " +
+      "initialization is complete")
+    store.createColFamilyIfAbsent(stateName)
+    val resultState = new ValueStateImpl[T](store, stateName, keyEncoder, valEncoder, serializer)
     resultState
   }
 

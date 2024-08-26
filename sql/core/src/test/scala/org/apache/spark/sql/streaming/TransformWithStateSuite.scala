@@ -25,9 +25,13 @@ import org.apache.hadoop.fs.Path
 
 import org.apache.spark.{SparkRuntimeException, SparkUnsupportedOperationException}
 import org.apache.spark.internal.Logging
+<<<<<<< HEAD
+import org.apache.spark.sql.{AnalysisException, Encoders, SaveMode}
+=======
 import org.apache.spark.sql.{Dataset, Encoders, Row}
 import org.apache.spark.sql.catalyst.util.stringToFile
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
+>>>>>>> 542b24a95960c8ff07b3adbb58e39ab11d476ca1
 import org.apache.spark.sql.execution.streaming._
 import org.apache.spark.sql.execution.streaming.state._
 import org.apache.spark.sql.functions.timestamp_seconds
@@ -44,9 +48,17 @@ class RunningCountStatefulProcessor extends StatefulProcessor[String, String, (S
   @transient protected var _countState: ValueState[Long] = _
 
   override def init(
+<<<<<<< HEAD
+      handle: StatefulProcessorHandle,
+      outputMode: OutputMode) : Unit = {
+    _processorHandle = handle
+    assert(handle.getQueryInfo().getBatchId >= 0)
+    _countState = _processorHandle.getValueState[Long]("countState", Encoders.scalaLong)
+=======
       outputMode: OutputMode,
       timeMode: TimeMode): Unit = {
     _countState = getHandle.getValueState[Long]("countState", Encoders.scalaLong)
+>>>>>>> 542b24a95960c8ff07b3adbb58e39ab11d476ca1
   }
 
   override def handleInputRows(
@@ -382,7 +394,11 @@ class RunningCountStatefulProcessorWithError extends RunningCountStatefulProcess
       timerValues: TimerValues,
       expiredTimerInfo: ExpiredTimerInfo): Iterator[(String, String)] = {
     // Trying to create value state here should fail
+<<<<<<< HEAD
+    _tempState = _processorHandle.getValueState[Long]("tempState", Encoders.scalaLong)
+=======
     _tempState = getHandle.getValueState[Long]("tempState", Encoders.scalaLong)
+>>>>>>> 542b24a95960c8ff07b3adbb58e39ab11d476ca1
     Iterator.empty
   }
 }

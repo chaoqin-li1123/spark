@@ -41,6 +41,21 @@ case class TestClass(var id: Long, var name: String)
  * Class that adds tests for single value ValueState types used in arbitrary stateful
  * operators such as transformWithState
  */
+case class TestClass(var id: Long, var name: String)
+
+class ValueStateSuite extends SharedSparkSession
+  with BeforeAndAfter {
+
+  before {
+    StateStore.stop()
+    require(!StateStore.isMaintenanceRunning)
+  }
+
+  after {
+    StateStore.stop()
+    require(!StateStore.isMaintenanceRunning)
+  }
+
 class ValueStateSuite extends StateVariableSuiteBase {
 
   import StateStoreTestsHelper._
@@ -89,6 +104,7 @@ class ValueStateSuite extends StateVariableSuiteBase {
     }
   }
 
+
   test("Value state operations for single instance") {
     tryWithProviderResource(newStoreProviderWithStateVariable(true)) { provider =>
       val store = provider.getStore(0)
@@ -121,10 +137,10 @@ class ValueStateSuite extends StateVariableSuiteBase {
       val handle = new StatefulProcessorHandleImpl(store, UUID.randomUUID(),
         Encoders.STRING.asInstanceOf[ExpressionEncoder[Any]], TimeMode.None())
 
-      val testState1: ValueState[Long] = handle.getValueState[Long](
-        "testState1", Encoders.scalaLong)
-      val testState2: ValueState[Long] = handle.getValueState[Long](
-        "testState2", Encoders.scalaLong)
+      val testState1: ValueState[Long] = handle.getValueState[Long]("testState1",
+        Encoders.scalaLong)
+      val testState2: ValueState[Long] = handle.getValueState[Long]("testState2",
+        Encoders.scalaLong)
       ImplicitGroupingKeyTracker.setImplicitKey("test_key")
       testState1.update(123)
       assert(testState1.get() === 123)
@@ -273,6 +289,7 @@ class ValueStateSuite extends StateVariableSuiteBase {
       assert(testState.get() === TestClass(3, "testcase3"))
 
       testState.clear()
+
       assert(!testState.exists())
       assert(testState.get() === null)
     }
