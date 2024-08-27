@@ -328,17 +328,22 @@ class ValueStateSuite extends SharedSparkSession
 
   test("avro encode double") {
     val valEncoder = Encoders.DOUBLE
-    val stateEncoder = new StateEncoder[java.lang.Double](valEncoder)
 
+    var x = 0.0
     val startTime = System.nanoTime()
-    for (i <- 1 to 10000000) {
-      val row = stateEncoder.encodeValSparkSQL(12.3 + i)
+    for (i <- 1 to 100) {
+      val stateEncoder = new StateEncoder[java.lang.Double](valEncoder)
+      val row = stateEncoder.encodeValToAvro(12.3 + i)
+      x = stateEncoder.decodeAvroToValue(row)
+      // assert(x == 12.3 + i)
     }
     val endTime = System.nanoTime()
     val elapsed = {
       (endTime - startTime) / 1.0e6
     }
     println(s"panda avro encode take $elapsed ms double")
+
+
   }
 
   test("rocksdb put") {
